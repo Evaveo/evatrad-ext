@@ -7,7 +7,8 @@ export class CallButtonAudioManager {
         this.audioContext = null;
         this.stream = null;
         this.isRecording = false;
-        this.chunks = [];
+        this.audioQueue = [];
+        this.isPlayingAudio = false;
     }
 
     async setupAudioStream() {
@@ -15,40 +16,34 @@ export class CallButtonAudioManager {
             // Demander l'accès au microphone avec des contraintes spécifiques
             this.stream = await navigator.mediaDevices.getUserMedia({
                 audio: {
+                    channelCount: 1,
+                    sampleRate: 48000,
                     echoCancellation: true,
                     noiseSuppression: true,
-                    autoGainControl: true,
-                    sampleRate: 16000
+                    autoGainControl: true
                 }
             });
 
-            this.audioContext = new AudioContext({
-                sampleRate: 16000
-            });
-
             // Configurer le MediaRecorder avec les options optimales
+            const mimeType = this.getSupportedMimeType();
+            if (!mimeType) {
+                throw new Error('No supported audio format found');
+            }
+
             this.mediaRecorder = new MediaRecorder(this.stream, {
-                mimeType: 'audio/webm;codecs=opus',
-                audioBitsPerSecond: 16000
+                mimeType: mimeType,
+                bitsPerSecond: 96000
             });
 
-            // Gérer les données audio
-            this.mediaRecorder.ondataavailable = async (event) => {
-                if (event.data.size > 0) {
-                    this.chunks.push(event.data);
-                    
-                    // Créer un blob avec tous les chunks
-                    const audioBlob = new Blob(this.chunks, { type: 'audio/webm;codecs=opus' });
-                    this.chunks = []; // Réinitialiser les chunks
-
-                    // Convertir en base64 et envoyer
-                    if (this.ws.readyState === WebSocket.OPEN) {
-                        const base64data = await this.blobToBase64(audioBlob);
-                        this.ws.send(JSON.stringify({
-                            type: MESSAGE_TYPES.AUDIO,
-                            audio: base64data.split(',')[1],
-                            source: MESSAGE_TYPES.SOURCE.CALLER
-                        }));
+            // Configurer les gestionnaires d'événements
+            this.mediaRecorder.ondataavailable = async (e) => {
+                if (e.data.size > 0) {
+                    try {
+                        const timestamp = Date.now();
+                        const base64Audio = await this.convertAudioToBase64(e.data);
+                        this.sendAudioToServer(base64Audio, timestamp);
+                    } catch (error) {
+                        console.error('Error processing audio data:', error);
                     }
                 }
             };
@@ -60,7 +55,12 @@ export class CallButtonAudioManager {
         }
     }
 
-    async blobToBase64(blob) {
+    getSupportedMimeType() {
+        const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
+        return types.find(type => MediaRecorder.isTypeSupported(type));
+    }
+
+    async convertAudioToBase64(blob) {
         return new Promise((resolve, reject) => {
             const reader = new FileReader();
             reader.onloadend = () => resolve(reader.result);
@@ -69,11 +69,21 @@ export class CallButtonAudioManager {
         });
     }
 
+    sendAudioToServer(base64Audio, timestamp) {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({
+                type: MESSAGE_TYPES.AUDIO,
+                audio: base64Audio.split(',')[1],
+                timestamp: timestamp,
+                source: MESSAGE_TYPES.SOURCE.CALLER
+            }));
+        }
+    }
+
     startRecording() {
         if (this.mediaRecorder && this.mediaRecorder.state === 'inactive') {
             this.isRecording = true;
-            this.chunks = [];
-            this.mediaRecorder.start(100); // Envoyer les données toutes les 100ms
+            this.mediaRecorder.start(250); // Envoyer les données toutes les 250ms
         }
     }
 
@@ -81,108 +91,62 @@ export class CallButtonAudioManager {
         if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
             this.isRecording = false;
             this.mediaRecorder.stop();
-            this.chunks = [];
         }
     }
 
-    handleIncomingAudio(audioData) {
+    async handleIncomingAudio(base64Audio) {
         try {
-            console.log('Analyse des données audio reçues:', {
-                dataType: typeof audioData,
-                length: audioData?.length,
-                firstChars: audioData?.substring(0, 50)
+            // Create data URL for MP3 audio
+            const dataUrl = `data:audio/mpeg;base64,${base64Audio}`;
+            
+            // Create and configure audio element
+            const audio = new Audio();
+            audio.preload = 'auto';  // Ensure audio is preloaded
+            
+            // Set up audio element
+            await new Promise((resolve, reject) => {
+                audio.addEventListener('canplaythrough', resolve, { once: true });
+                audio.addEventListener('error', (e) => reject(new Error(`Audio loading error: ${e.target.error.message}`)), { once: true });
+                audio.src = dataUrl;  // Set source after adding event listeners
             });
 
-            // Vérifier si l'audio est déjà au format data URL
-            if (audioData.startsWith('data:audio')) {
-                console.log('Audio déjà au format data URL');
-                this.playAudio(audioData);
-            } else {
-                // Essayer différents formats MIME
-                const formats = [
-                    'audio/wav',
-                    'audio/webm',
-                    'audio/ogg',
-                    'audio/mpeg'
-                ];
+            // Add to queue once audio is ready
+            this.audioQueue.push(audio);
 
-                for (const format of formats) {
-                    try {
-                        const dataUrl = `data:${format};base64,${audioData}`;
-                        console.log(`Tentative avec le format: ${format}`);
-                        this.playAudio(dataUrl);
-                        break;
-                    } catch (err) {
-                        console.log(`Échec avec le format ${format}:`, err);
-                    }
-                }
+            // Start playing if not already playing
+            if (!this.isPlayingAudio) {
+                await this.playNextInQueue();
             }
         } catch (error) {
             console.error('Erreur lors du traitement de l\'audio:', error);
-            this.fallbackAudioPlay(audioData);
         }
     }
 
-    playAudio(dataUrl) {
-        const audio = new Audio(dataUrl);
-        
-        audio.onloadedmetadata = () => {
-            console.log('Métadonnées audio chargées:', {
-                durée: audio.duration,
-                volume: audio.volume,
-                format: audio.src.split(';')[0].split(':')[1]
-            });
-        };
+    async playNextInQueue() {
+        if (this.audioQueue.length === 0) {
+            this.isPlayingAudio = false;
+            return;
+        }
 
-        audio.onplay = () => console.log('Lecture audio démarrée');
-        audio.onended = () => console.log('Lecture audio terminée');
-        audio.onerror = (e) => {
-            console.error('Erreur de lecture audio:', {
-                error: e,
-                code: audio.error?.code,
-                message: audio.error?.message
-            });
-            throw e; // Propager l'erreur pour essayer la méthode de secours
-        };
+        this.isPlayingAudio = true;
+        const audio = this.audioQueue.shift();
 
-        return audio.play();
-    }
-
-    async fallbackAudioPlay(audioData) {
         try {
-            console.log('Tentative de lecture avec Web Audio API');
-            
-            // Si les données sont en base64, les convertir
-            let arrayBuffer;
-            if (typeof audioData === 'string') {
-                const binaryString = atob(audioData);
-                arrayBuffer = new ArrayBuffer(binaryString.length);
-                const bytes = new Uint8Array(arrayBuffer);
-                for (let i = 0; i < binaryString.length; i++) {
-                    bytes[i] = binaryString.charCodeAt(i);
-                }
-            } else {
-                arrayBuffer = audioData;
-            }
+            audio.onended = () => {
+                // Clean up this audio element
+                audio.src = '';
+                audio.remove();
+                // Play next in queue
+                this.playNextInQueue();
+            };
 
-            const audioContext = new AudioContext();
-            console.log('Décodage des données audio...');
-            
-            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-            console.log('Données audio décodées:', {
-                durée: audioBuffer.duration,
-                nombreCanaux: audioBuffer.numberOfChannels,
-                tauxEchantillonnage: audioBuffer.sampleRate
-            });
-            
-            const source = audioContext.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(audioContext.destination);
-            
-            source.start(0);
-            console.log('Lecture audio de secours démarrée');
+            await audio.play();
         } catch (error) {
-            console.error('Échec de la méthode de secours:', error);
+            console.error('Erreur lors de la lecture audio:', error);
+            // Clean up on error
+            audio.src = '';
+            audio.remove();
+            this.playNextInQueue(); // Passer au suivant en cas d'erreur
         }
     }
 
@@ -195,6 +159,12 @@ export class CallButtonAudioManager {
         if (this.audioContext) {
             this.audioContext.close();
         }
-        this.chunks = [];
+        // Clean up any remaining audio elements in the queue
+        this.audioQueue.forEach(audio => {
+            audio.src = '';
+            audio.remove();
+        });
+        this.audioQueue = [];
+        this.isPlayingAudio = false;
     }
 }

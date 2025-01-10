@@ -7,6 +7,9 @@ class EVACallButton extends HTMLElement {
         this.attachShadow({ mode: 'open' });
         this.audioManager = null;
         this.callActive = false;
+        this.connectionAttempts = 0;
+        this.maxConnectionAttempts = 5;
+        this.isConnecting = false;
     }
 
     async connectedCallback() {
@@ -120,19 +123,40 @@ class EVACallButton extends HTMLElement {
         this.initWebSocket();
     }
 
-    initWebSocket() {
-        const wsUrl = document.querySelector('meta[name="websocket-url"]')?.content;
-        if (!wsUrl) {
-            console.error('WebSocket URL not found in meta tags');
+    async initWebSocket() {
+        if (this.isConnecting) {
+            console.log('Connection attempt already in progress...');
             return;
         }
 
+        this.isConnecting = true;
+        const wsUrl = document.querySelector('meta[name="websocket-url"]')?.content;
+        if (!wsUrl) {
+            console.error('WebSocket URL not found in meta tags');
+            this.isConnecting = false;
+            return;
+        }
+
+        if (this.connectionAttempts >= this.maxConnectionAttempts) {
+            console.error('Maximum connection attempts reached');
+            this.isConnecting = false;
+            return;
+        }
+
+        console.log(`Attempting to connect to WebSocket (attempt ${this.connectionAttempts + 1}/${this.maxConnectionAttempts})...`);
         this.ws = new WebSocket(wsUrl);
         
-        this.ws.onopen = () => {
-            console.log('WebSocket connected');
-            // Send initial language settings
-            this.updateLanguages();
+        this.ws.onopen = async () => {
+            console.log('WebSocket connected successfully');
+            this.connectionAttempts = 0;
+            this.isConnecting = false;
+            
+            try {
+                // Send initial language settings
+                this.updateLanguages();
+            } catch (error) {
+                console.error('Error during initialization:', error);
+            }
         };
 
         this.ws.onmessage = async (event) => {
@@ -165,21 +189,17 @@ class EVACallButton extends HTMLElement {
                         }
                         break;
 
-                    case MESSAGE_TYPES.TRANSCRIPTION:
-                        console.log('Transcription reçue:', data.text);
-                        // Envoyer la transcription pour traduction
-                        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                            this.ws.send(JSON.stringify({
-                                type: MESSAGE_TYPES.TRANSLATION_REQUEST,
-                                text: data.text,
-                                source: data.source,
-                                sourceLang: data.source === MESSAGE_TYPES.SOURCE.CALLER ? 
-                                    this.getAttribute('caller-lang') : 
-                                    this.getAttribute('receiver-lang'),
-                                targetLang: data.source === MESSAGE_TYPES.SOURCE.CALLER ? 
-                                    this.getAttribute('receiver-lang') : 
-                                    this.getAttribute('caller-lang')
-                            }));
+                    case MESSAGE_TYPES.TRANSCRIPTION.INTERIM:
+                    case MESSAGE_TYPES.TRANSCRIPTION.FINAL:
+                        console.log('Transcription reçue:', data);
+                        // Si c'est une transcription finale avec audio, jouer l'audio
+                        if (data.type === MESSAGE_TYPES.TRANSCRIPTION.FINAL && 
+                            data.audioBase64 && 
+                            data.source === MESSAGE_TYPES.SOURCE.RECEIVER) {
+                            console.log('Playing received audio from transcription');
+                            if (this.audioManager) {
+                                this.audioManager.handleIncomingAudio(data.audioBase64);
+                            }
                         }
                         break;
 
@@ -212,7 +232,16 @@ class EVACallButton extends HTMLElement {
         this.ws.onclose = () => {
             console.log('WebSocket disconnected');
             this.cleanup();
-            setTimeout(() => this.initWebSocket(), 1000);
+            this.isConnecting = false;
+            
+            if (this.connectionAttempts < this.maxConnectionAttempts) {
+                this.connectionAttempts++;
+                const delay = Math.min(1000 * Math.pow(2, this.connectionAttempts - 1), 10000);
+                console.log(`Reconnecting in ${delay}ms...`);
+                setTimeout(() => this.initWebSocket(), delay);
+            } else {
+                console.error('Maximum reconnection attempts reached');
+            }
         };
 
         this.ws.onerror = (error) => {
@@ -243,71 +272,56 @@ class EVACallButton extends HTMLElement {
 
     async startCall() {
         try {
-            // Initialiser l'audio
-            this.audioManager = new CallButtonAudioManager(this.ws);
-            const audioInitialized = await this.audioManager.setupAudioStream();
-            
-            if (!audioInitialized) {
-                throw new Error('Failed to initialize audio');
+            const phoneNumber = this.getAttribute('phone');
+            if (!phoneNumber) {
+                throw new Error('Numéro de téléphone non spécifié');
             }
 
-            const phone = this.getAttribute('phone');
-            if (!phone) {
-                throw new Error('Phone number is required');
-            }
-
+            // Faire la requête HTTP pour démarrer l'appel
             const response = await fetch('/call', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    to: phone
-                })
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ to: phoneNumber })
             });
-
-            if (!response.ok) {
-                throw new Error('Failed to start call');
-            }
-
-            // Démarrer l'enregistrement audio
-            this.audioManager.startRecording();
             
-            console.log('Call started successfully');
-            return true;
+            const data = await response.json();
+            if (data.success) {
+                console.log('Appel démarré avec succès:', data.callSid);
+                
+                // Initialiser l'AudioManager si nécessaire
+                if (!this.audioManager) {
+                    console.log('Initialisation de l\'AudioManager...');
+                    this.audioManager = new CallButtonAudioManager(this.ws);
+                    const audioInitialized = await this.audioManager.setupAudioStream();
+                    
+                    if (!audioInitialized) {
+                        throw new Error('Impossible d\'initialiser le flux audio');
+                    }
+                }
+                
+                // Démarrer l'enregistrement audio
+                this.audioManager.startRecording();
+                return true;
+            } else {
+                throw new Error(data.error || 'Erreur lors du démarrage de l\'appel');
+            }
         } catch (error) {
             console.error('Error starting call:', error);
-            this.cleanup();
             return false;
         }
     }
 
     async endCall() {
-        try {
-            // Arrêter l'enregistrement audio
-            if (this.audioManager) {
-                this.audioManager.stopRecording();
-            }
-
-            const response = await fetch('/end-call', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    callSid: this.callSid
-                })
-            });
-
-            if (!response.ok) {
-                throw new Error('Failed to end call');
-            }
-
-            console.log('Call ended successfully');
-            this.cleanup();
-        } catch (error) {
-            console.error('Error ending call:', error);
+        if (this.audioManager) {
+            this.audioManager.stopRecording();
+            this.audioManager.cleanup();
+            this.audioManager = null;
         }
+        
+        this.callActive = false;
+        const button = this.shadowRoot.querySelector('button');
+        button.classList.remove('active');
+        button.disabled = false;
     }
 
     cleanup() {
