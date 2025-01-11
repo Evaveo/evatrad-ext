@@ -120,35 +120,28 @@ class EvatradButton {
 
     async startCall() {
         try {
-            if (!this.config.phoneNumber) {
-                alert('Veuillez entrer un numéro de téléphone');
-                return;
-            }
-
             const response = await fetch(`${this.config.apiBaseUrl}/call`, {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({
-                    to: this.config.phoneNumber,
+                    phoneNumber: this.config.phoneNumber,
                     callerLanguage: this.config.callerLanguage,
                     receiverLanguage: this.config.receiverLanguage
                 })
             });
 
-            const data = await response.json();
-            if (data.success) {
-                console.log('Appel initié avec succès - SID:', data.callSid);
-                this.currentCallSid = data.callSid;
-                await this.connectWebSocket();
-                await this.startRecording();
-                this.callStatus.textContent = 'Appel en cours...';
-                this.button.classList.add('recording');
-            } else {
-                this.callStatus.textContent = data.error || 'Erreur lors de l\'initiation de l\'appel';
-                throw new Error(data.error || 'Erreur lors de l\'initiation de l\'appel');
+            if (!response.ok) {
+                throw new Error('Erreur lors de l\'initialisation de l\'appel');
             }
+
+            const data = await response.json();
+            this.currentCallSid = data.callSid;
+            await this.connectWebSocket();
+            await this.startRecording();
+            this.callStatus.textContent = 'Appel en cours...';
+            this.button.classList.add('recording');
         } catch (error) {
             console.error('Error starting call:', error);
             this.callStatus.textContent = 'Erreur lors du démarrage de l\'appel';
