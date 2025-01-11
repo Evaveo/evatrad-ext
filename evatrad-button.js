@@ -3,13 +3,20 @@ class EvatradButton {
         if (!config.phoneNumber) {
             throw new Error('Le numéro de téléphone est requis');
         }
+        if (!config.apiBaseUrl) {
+            throw new Error('L\'URL de base de l\'API est requise');
+        }
         
         this.button = buttonElement;
+        // Convertir l'URL de base en URL WebSocket
+        const wsBaseUrl = config.apiBaseUrl.replace(/^http/, 'ws');
+        
         this.config = {
             phoneNumber: config.phoneNumber,
             callerLanguage: config.callerLanguage || 'fr-FR',
             receiverLanguage: config.receiverLanguage || 'en-US',
-            wsUrl: config.wsUrl || 'wss://759e162763ba.ngrok.app/browser'
+            apiBaseUrl: config.apiBaseUrl,
+            wsUrl: `${wsBaseUrl}/browser`
         };
 
         this.isRecording = false;
@@ -118,7 +125,7 @@ class EvatradButton {
                 return;
             }
 
-            const response = await fetch('/call', {
+            const response = await fetch(`${this.config.apiBaseUrl}/call`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -312,7 +319,7 @@ class EvatradButton {
     async endCall() {
         if (this.currentCallSid) {
             try {
-                const response = await fetch('/end-call', {
+                const response = await fetch(`${this.config.apiBaseUrl}/end-call`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
