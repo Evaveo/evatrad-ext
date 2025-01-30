@@ -1,481 +1,445 @@
-class EvatradButton {
-    constructor(buttonElement, config) {
-        if (!config.phoneNumber) {
-            throw new Error('Le numéro de téléphone est requis');
+// --------------------- Classe EvatradUI --------------------- //
+class EvatradUI {
+    constructor() {
+        // Récupération du modal
+        this.modalElement = document.getElementById('evatradCallModal');
+        if (this.modalElement) {
+            this.modal = new bootstrap.Modal(this.modalElement);
+            this.callStatus = this.modalElement.querySelector('#callStatus');
+            this.myTranscription = this.modalElement.querySelector('#myTranscription');
+            this.otherTranscription = this.modalElement.querySelector('#otherTranscription');
+            this.endCallButton = this.modalElement.querySelector('#endCallButton');
         }
-        if (!config.apiBaseUrl) {
-            throw new Error('L\'URL de base de l\'API est requise');
-        }
-        
-        this.button = buttonElement;
-        // Convertir l'URL de base en URL WebSocket
-        const wsBaseUrl = config.apiBaseUrl.replace(/^http/, 'ws');
-        
-        this.config = {
-            phoneNumber: config.phoneNumber,
-            callerLanguage: config.callerLanguage || 'fr-FR',
-            receiverLanguage: config.receiverLanguage || 'en-US',
-            apiBaseUrl: config.apiBaseUrl,
-            wsUrl: `${wsBaseUrl}/browser`
-        };
 
-        this.isRecording = false;
-        this.mediaRecorder = null;
-        this.ws = null;
-        this.audioQueue = [];  // File d'attente pour les audios
-        this.isPlayingAudio = false;  // Flag pour savoir si un audio est en cours
-        this.isPlaying = false;
-        this.isPlayingTranslation = false;
+        // Gestion audio TTS (Receiver → Caller) sous forme de queue
+        this.audioQueue = [];
+        this.isPlayingAudio = false;
+        this.currentSource = null;
         this.audioContext = null;
-        this.currentCallSid = null;
-        this.waitingAudio = null;
-        this.waitingAudioLoop = null;
-        this.translationQueue = [];
-        this.currentAudio = null; // Pour garder une référence à l'audio en cours
 
-        this.init();
+        this.onEndCallClick = null;
+        if (this.endCallButton) {
+            this.endCallButton.addEventListener('click', () => {
+                if (typeof this.onEndCallClick === 'function') {
+                    this.onEndCallClick();
+                }
+            });
+        }
     }
 
-    init() {
-        this.createCallInterface();
-        this.initAudioContext();
-        this.button.addEventListener('click', () => {
-            if (this.currentCallSid) {
-                this.endCall();
-            } else {
-                this.showCallInterface();
-            }
-        });
+    // ---- Interface du modal ----
+    showModal() {
+        if (this.modal) this.modal.show();
+    }
+    hideModal() {
+        if (this.modal) this.modal.hide();
+    }
+    setCallStatus(text) {
+        if (this.callStatus) {
+            this.callStatus.textContent = text;
+        }
+    }
+    clearTranscriptions() {
+        if (this.myTranscription) this.myTranscription.innerHTML = '';
+        if (this.otherTranscription) this.otherTranscription.innerHTML = '';
     }
 
-    updateButtonState(isInCall) {
-        if (isInCall) {
-            this.button.textContent = 'Raccrocher';
-            this.button.classList.add('in-call');
-            this.button.classList.add('btn-danger');
-            this.button.classList.remove('btn-primary');
+    // ---- Transcriptions ----
+    appendTranscription(source, originalText, translatedText, isFinal, audioBase64) {
+        // source = 'caller' ou 'receiver'
+        const isCaller = (source === 'caller');
+        const container = isCaller ? this.myTranscription : this.otherTranscription;
+        if (!container) return;
+
+        // Efface la transcription interim si on reçoit un "final"
+        if (isFinal) {
+            const oldInterim = container.querySelector('.transcription-item.interim');
+            if (oldInterim) oldInterim.remove();
+        }
+
+        // Crée une div .transcription-item
+        const div = document.createElement('div');
+        div.classList.add('transcription-item', isFinal ? 'final' : 'interim');
+        div.innerHTML = `
+            <div class="original">${originalText}</div>
+            <div class="translation">${translatedText}</div>
+        `;
+        container.appendChild(div);
+        container.scrollTop = container.scrollHeight;
+
+        // S’il y a un audioBase64 (receiver → caller), on le joue via la queue
+        if (audioBase64) {
+            this.queueAudio(audioBase64);
+        }
+    }
+
+    // ---- Gestion du bouton principal ----
+    updateMainButton(button, inCall) {
+        if (!button) return;
+        if (inCall) {
+            button.textContent = 'Raccrocher';
+            button.classList.add('btn-danger');
+            button.classList.remove('btn-primary');
         } else {
-            this.button.textContent = 'Appeler';
-            this.button.classList.remove('in-call');
-            this.button.classList.remove('btn-danger');
-            this.button.classList.add('btn-primary');
+            button.textContent = 'Appeler';
+            button.classList.remove('btn-danger');
+            button.classList.add('btn-primary');
         }
     }
-
-    initAudioContext() {
-        document.addEventListener('click', () => {
-            if (!this.audioContext) {
-                this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            }
-        }, { once: true });
+    setOnEndCallClick(callback) {
+        this.onEndCallClick = callback;
     }
 
-    createCallInterface() {
-        const modal = document.createElement('div');
-        modal.className = 'modal fade';
-        modal.id = 'evatradCallModal_' + Math.random().toString(36).substr(2, 9);
-        modal.setAttribute('tabindex', '-1');
-        
-        modal.innerHTML = `
-            <div class="modal-dialog">
-                <div class="modal-content">
-                    <div class="modal-header">
-                        <h5 class="modal-title">Appel en cours</h5>
-                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-                    </div>
-                    <div class="modal-body">
-                        <div id="callStatus" class="alert alert-info">Initialisation...</div>
-                        <div class="transcription">
-                            <h3>Ma transcription</h3>
-                            <div id="myTranscription"></div>
-                        </div>
-                        <div class="transcription">
-                            <h3>Transcription de l'interlocuteur</h3>
-                            <div id="otherTranscription"></div>
-                        </div>
-                    </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-danger" id="endCallButton">Terminer l'appel</button>
-                    </div>
-                </div>
-            </div>
-        `;
-
-        const style = document.createElement('style');
-        style.textContent = `
-            .transcription {
-                margin: 20px;
-                padding: 20px;
-                border: 1px solid #ddd;
-                border-radius: 5px;
-                height: 200px;
-                overflow-y: auto;
-            }
-            .original {
-                color: #333;
-                margin-bottom: 5px;
-            }
-            .translation {
-                color: #666;
-                font-style: italic;
-                margin-left: 10px;
-            }
-        `;
-        document.head.appendChild(style);
-        document.body.appendChild(modal);
-        
-        this.modal = new bootstrap.Modal(modal);
-        
-        modal.querySelector('#endCallButton').addEventListener('click', () => this.endCall());
-        modal.addEventListener('hidden.bs.modal', () => this.endCall());
-
-        this.modalElement = modal;
-        this.callStatus = modal.querySelector('#callStatus');
-        this.myTranscription = modal.querySelector('#myTranscription');
-        this.otherTranscription = modal.querySelector('#otherTranscription');
-    }
-
-    showCallInterface() {
-        if (!this.config.phoneNumber) {
-            alert('Veuillez entrer un numéro de téléphone');
-            return;
-        }
-        this.modal.show();
-        this.startCall();
-    }
-
-    async startCall() {
-        try {
-            if (!this.config.phoneNumber) {
-                alert('Veuillez entrer un numéro de téléphone');
-                return;
-            }
-
-            // Démarrer le message d'attente
-            await this.playWaitingMessage();
-
-            const response = await fetch(`${this.config.apiBaseUrl}/call`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    to: this.config.phoneNumber,
-                    callerLanguage: this.config.callerLanguage,
-                    receiverLanguage: this.config.receiverLanguage
-                })
-            });
-
-            const data = await response.json();
-            if (data.success) {
-                console.log('Appel initié avec succès - SID:', data.callSid);
-                this.currentCallSid = data.callSid;
-                this.updateButtonState(true);
-                await this.connectWebSocket();
-                await this.startRecording();
-                this.callStatus.textContent = 'Appel en cours...';
-                this.button.classList.add('recording');
-            } else {
-                this.stopWaitingMessage();
-                this.callStatus.textContent = data.error || 'Erreur lors de l\'initiation de l\'appel';
-                throw new Error(data.error || 'Erreur lors de l\'initiation de l\'appel');
-            }
-        } catch (error) {
-            console.error('Error starting call:', error);
-            this.stopWaitingMessage();
-            this.callStatus.textContent = 'Erreur lors du démarrage de l\'appel';
-            this.endCall();
-        }
-    }
-
-    async playWaitingMessage() {
-        try {
-            // D'abord jouer le message de bienvenue
-            const welcomeResponse = await fetch(`${this.config.apiBaseUrl}/audio-messages?language=${this.config.callerLanguage}&type=welcome`);
-            const welcomeBlob = await welcomeResponse.blob();
-            const welcomeAudio = new Audio(URL.createObjectURL(welcomeBlob));
-            
-            // Attendre que le message de bienvenue soit terminé
-            await new Promise((resolve) => {
-                welcomeAudio.onended = resolve;
-                welcomeAudio.play();
-            });
-
-            // Ensuite, commencer la boucle du message d'attente
-            const waitingResponse = await fetch(`${this.config.apiBaseUrl}/audio-messages?language=${this.config.callerLanguage}&type=waiting`);
-            const waitingBlob = await waitingResponse.blob();
-            this.waitingAudio = new Audio(URL.createObjectURL(waitingBlob));
-            this.waitingAudio.loop = true;
-            await this.waitingAudio.play();
-        } catch (error) {
-            console.error('Erreur lors de la lecture du message d\'attente:', error);
-        }
-    }
-
-    stopWaitingMessage() {
-        this.stopAllAudio();  // Arrêter tous les audios en cours et vider la file
-        if (this.waitingAudio) {
-            this.waitingAudio.pause();
-            this.waitingAudio.currentTime = 0;
-            this.waitingAudio = null;
-        }
-    }
-
+    // ---- Queue audio (Receiver → Caller) ----
     queueAudio(audioBase64) {
         this.audioQueue.push(audioBase64);
-        // Si aucun audio n'est en cours, démarrer la lecture
         if (!this.isPlayingAudio) {
             this.playNextAudio();
         }
     }
-
     async playNextAudio() {
-        if (this.audioQueue.length === 0 || this.isPlayingAudio) {
-            return;
-        }
-
-        console.log('Lecture du prochain audio, taille de la file:', this.audioQueue.length);
+        if (this.audioQueue.length === 0 || this.isPlayingAudio) return;
         this.isPlayingAudio = true;
+
         const audioBase64 = this.audioQueue.shift();
-
         try {
-            // Vérifier que l'audioContext est initialisé
-            if (!this.audioContext) {
-                console.log('Initialisation de audioContext');
-                this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                await this.audioContext.resume();
-            }
-
-            // Décoder l'audio base64
-            const response = await fetch(`data:audio/mp3;base64,${audioBase64}`);
-            const arrayBuffer = await response.arrayBuffer();
-            
-            console.log('Décodage de l\'audio...');
-            const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
-            
-            console.log('Création de la source audio...');
-            const source = this.audioContext.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(this.audioContext.destination);
-            
-            // Jouer l'audio
-            console.log('Démarrage de la lecture...');
-            source.start(0);
-            
-            // Attendre la fin de la lecture
-            await new Promise((resolve) => {
-                source.onended = () => {
-                    console.log('Audio terminé avec succès');
-                    resolve();
-                };
-            });
-
+            await this.playInlineAudio(audioBase64);
+        } catch (err) {
+            console.error('Erreur lecture audio dans queue:', err);
+        } finally {
             this.isPlayingAudio = false;
-            this.playNextAudio();
-        } catch (error) {
-            console.error('Erreur lors de la lecture audio:', error);
-            this.isPlayingAudio = false;
-            this.playNextAudio();
+            this.playNextAudio(); // on enchaîne
         }
     }
 
-    stopAllAudio() {
-        if (this.currentAudio) {
-            this.currentAudio.pause();
-            this.currentAudio.currentTime = 0;
-            this.currentAudio = null;
-        }
-        this.audioQueue = [];  // Vider la file d'attente
-        this.isPlayingAudio = false;
-    }
-
-    connectWebSocket() {
-        return new Promise((resolve, reject) => {
+    // ---- Lecture d’un audio en base64 (MP3) de manière "inline" (synchrone) ----
+    // Ici, on crée un AudioBuffer et on attend la fin pour résoudre la Promise.
+    playInlineAudio(base64) {
+        return new Promise(async (resolve, reject) => {
             try {
-                this.ws = new WebSocket(this.config.wsUrl);
+                if (!this.audioContext) {
+                    this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    await this.audioContext.resume();
+                }
+                const arrayBuffer = this.decodeBase64ToArrayBuffer(base64);
+                const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
+                const source = this.audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(this.audioContext.destination);
 
-                this.ws.onmessage = (event) => {
-                    this.handleWebSocketMessage(event);
-                };
-
-                this.ws.onopen = () => {
-                    console.log('WebSocket Connected');
-                    // Envoyer la configuration initiale
-                    this.ws.send(JSON.stringify({
-                        type: 'call',
-                        phoneNumber: this.config.phoneNumber,
-                        callerLanguage: this.config.callerLanguage,
-                        receiverLanguage: this.config.receiverLanguage
-                    }));
+                source.onended = () => {
                     resolve();
                 };
-
-                this.ws.onerror = (error) => {
-                    console.error('WebSocket Error:', error);
-                    reject(error);
-                };
-
-                this.ws.onclose = () => {
-                    console.log('WebSocket closed');
-                    this.endCall();
-                };
+                source.start(0);
             } catch (error) {
                 reject(error);
             }
         });
     }
 
+    // Convertit un base64 en ArrayBuffer
+    decodeBase64ToArrayBuffer(base64) {
+        const binaryString = window.atob(base64);
+        const len = binaryString.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+        }
+        return bytes.buffer;
+    }
+
+    // ---- Arrêter tout l’audio en cours (fin d’appel) ----
+    stopAllAudio() {
+        if (this.currentSource) {
+            try {
+                this.currentSource.stop();
+            } catch (err) {
+                console.error('Erreur en stoppant la source audio:', err);
+            }
+            this.currentSource = null;
+        }
+        this.audioQueue = [];
+        this.isPlayingAudio = false;
+    }
+}
+
+
+// --------------------- Classe EvatradButton --------------------- //
+class EvatradButton {
+    constructor(buttonElement, config, uiInstance) {
+        if (!config.phoneNumber) {
+            throw new Error('Le numéro de téléphone est requis');
+        }
+        if (!config.apiBaseUrl) {
+            throw new Error("L'URL de base de l'API est requise");
+        }
+
+        this.button = buttonElement;
+        this.ui = uiInstance;
+        this.config = {
+            phoneNumber: config.phoneNumber,
+            callerLanguage: config.callerLanguage || 'fr-FR',
+            receiverLanguage: config.receiverLanguage || 'en-US',
+            apiBaseUrl: config.apiBaseUrl,
+            partialTtsInterval: config.partialTtsInterval || 2000
+        };
+
+        // État
+        this.isRecording = false;
+        this.mediaRecorder = null;
+        this.ws = null;
+        this.currentCallSid = null;
+        this.isEndingCall = false;
+        this.playingWelcome = false;
+        this.playingWaiting = false;
+        this.waitingLoopActive = false;
+        this.receiverReady = false; // pour info si besoin
+
+        // Initialisation
+        this.initAudioContext();
+        this.attachEvents(buttonElement);
+        if (this.ui) {
+            this.ui.setOnEndCallClick(() => this.endCall());
+        }
+    }
+
+    attachEvents(button) {
+        button.addEventListener('click', () => {
+            if (this.currentCallSid) {
+                this.endCall();
+            } else {
+                if (this.ui) this.ui.showModal();
+                this.startCall();
+            }
+        });
+    }
+
+    // ---- Démarrage de l’appel ----
+    async startCall() {
+        try {
+            if (this.ui) {
+                this.ui.clearTranscriptions();
+                this.ui.setCallStatus('Initialisation...');
+            }
+
+            // 1) Jouer le message de bienvenue côté Caller
+            await this.playWelcomeMessage();
+
+            // 2) Démarrer la boucle d’attente
+            this.startWaitingLoop();
+
+            // 3) Faire la requête POST /call
+            const response = await fetch(`${this.config.apiBaseUrl}/call`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    to: this.config.phoneNumber,
+                    callerLanguage: this.config.callerLanguage,
+                    receiverLanguage: this.config.receiverLanguage,
+                    partialTtsInterval: this.config.partialTtsInterval
+                })
+            });
+            const data = await response.json();
+            if (!data.success) {
+                if (this.ui) this.ui.setCallStatus(data.error || "Erreur lors de l'initiation de l'appel");
+                throw new Error(data.error || 'Erreur /call');
+            }
+
+            this.currentCallSid = data.callSid;
+            if (this.ui) {
+                this.ui.setCallStatus('Appel en cours...');
+                this.ui.updateMainButton(this.button, true);
+            }
+
+            // 4) Connecter le WebSocket
+            await this.connectWebSocket();
+
+        } catch (error) {
+            console.error('Erreur startCall:', error);
+            if (this.ui) {
+                this.ui.setCallStatus("Erreur lors du démarrage de l'appel");
+            }
+            this.endCall();
+        }
+    }
+
+    // ---- Message de bienvenue ----
+    async playWelcomeMessage() {
+        try {
+            this.playingWelcome = true;
+            const url = `${this.config.apiBaseUrl}/audio-messages?language=${this.config.callerLanguage}&type=welcome`;
+            const resp = await fetch(url);
+            const blob = await resp.blob();
+            const arrayBuffer = await blob.arrayBuffer();
+            const base64 = this.arrayBufferToBase64(arrayBuffer);
+
+            if (this.ui) {
+                // On utilise la méthode inline du UI pour attendre la fin
+                await this.ui.playInlineAudio(base64);
+            } else {
+                // S'il n'y a pas d'UI, on peut faire un Audio(...) direct
+                await this.playAudioStandalone(base64);
+            }
+        } catch (err) {
+            console.error('Erreur playWelcomeMessage:', err);
+        } finally {
+            this.playingWelcome = false;
+        }
+    }
+
+    // ---- Boucle d’attente ----
+    async startWaitingLoop() {
+        this.waitingLoopActive = true;
+        this.playingWaiting = true;
+
+        while (this.waitingLoopActive) {
+            try {
+                const url = `${this.config.apiBaseUrl}/audio-messages?language=${this.config.callerLanguage}&type=waiting`;
+                const resp = await fetch(url);
+                const blob = await resp.blob();
+                const arrayBuffer = await blob.arrayBuffer();
+                const base64 = this.arrayBufferToBase64(arrayBuffer);
+
+                if (this.ui) {
+                    await this.ui.playInlineAudio(base64);
+                } else {
+                    await this.playAudioStandalone(base64);
+                }
+
+                // Petite pause
+                if (this.waitingLoopActive) {
+                    await new Promise(r => setTimeout(r, 3000));
+                }
+            } catch (error) {
+                console.error('Erreur startWaitingLoop:', error);
+                break;
+            }
+        }
+        this.playingWaiting = false;
+    }
+
+    stopWaitingLoop() {
+        this.waitingLoopActive = false;
+    }
+
+    // ---- WebSocket ----
+    async connectWebSocket() {
+        const wsBaseUrl = this.config.apiBaseUrl.replace(/^http/, 'ws');
+        const wsUrl = `${wsBaseUrl}/browser`;
+
+        this.ws = new WebSocket(wsUrl);
+
+        this.ws.onopen = () => {
+            console.log('WebSocket connecté.');
+            this.ws.send(JSON.stringify({
+                type: 'init',
+                callSid: this.currentCallSid
+            }));
+        };
+
+        this.ws.onmessage = (event) => {
+            this.handleWebSocketMessage(event);
+        };
+
+        this.ws.onerror = (error) => {
+            console.error('Erreur WebSocket:', error);
+        };
+
+        this.ws.onclose = () => {
+            console.log('WebSocket fermé.');
+        };
+    }
+
     handleWebSocketMessage(event) {
         try {
             const message = JSON.parse(event.data);
-            console.log('WebSocket message received:', message);
 
-            // Gérer les différents types de messages
             switch (message.type) {
                 case 'call_status':
-                    this.handleCallStatusMessage(message);
+                    if (this.ui && message.status) {
+                        this.ui.setCallStatus(message.status);
+                    }
+                    // Démarrer l'enregistrement dès que l'appel est décroché
+                    if (message.status === 'in-progress' || message.status === 'answered') {
+                        console.log('Call in progress => stop waiting + start recording');
+                        this.stopWaitingLoop();
+                        // Démarrer l'enregistrement immédiatement
+                        this.startRecording().catch(console.error);
+                    }
                     break;
+
+                case 'receiver_tts_done':
+                    // On ne démarre plus l'enregistrement ici car déjà fait au 'in-progress'
+                    console.log('Receiver TTS done (receiver ready)');
+                    this.receiverReady = true;
+                    break;
+
                 case 'transcription-interim':
                 case 'transcription-final':
                     this.handleTranscriptionMessage(message);
                     break;
+
                 case 'receiver_audio':
-                    console.log('Audio du receiver reçu, longueur:', message.audio.length);
-                    this.handleAudioMessage(message);
+                    // On ne fait rien avec l'audio du receiver pour l'instant
                     break;
-                case 'language':
-                    // Mise à jour de la langue
+
+                case 'call_ended':
+                    this.cleanupAfterCall();
                     break;
+
                 default:
-                    console.log('Message type non géré:', message.type);
+                    console.log('Unhandled websocket message type:', message.type);
+                    break;
             }
-        } catch (error) {
-            console.error('Error handling WebSocket message:', error);
+        } catch (err) {
+            console.error('Error parsing websocket message:', err);
         }
     }
 
-    handleCallStatusMessage(message) {
-        console.log('Call status:', message);
-        if (this.callStatus) {
-            this.callStatus.textContent = message.message || 'Appel en cours...';
-        }
+    handleTranscriptionMessage(msg) {
+        const isFinal = (msg.type === 'transcription-final');
+        const source = msg.source; // "caller" ou "receiver"
+        if (!this.ui) return;
+        this.ui.appendTranscription(
+            source,
+            msg.originalText,
+            msg.translatedText,
+            isFinal,
+            msg.audioBase64
+        );
     }
 
-    handleTranscriptionMessage(message) {
-        // Identifier qui parle (caller ou receiver)
-        const transcriptionDiv = (message.source === 'caller') 
-            ? this.myTranscription 
-            : this.otherTranscription;
-        
-        // Arrêter le message d'attente si c'est le receiver qui parle
-        if (message.source === 'receiver') {
-            this.stopWaitingMessage();
-        }
-
-        // Gérer les transcriptions intermédiaires (pendant que la personne parle)
-        if (message.type === 'transcription-interim') {
-            // Chercher s'il existe déjà une div interim
-            let interimDiv = transcriptionDiv.querySelector('.transcription-item.interim');
-            
-            // Si pas de div interim, en créer une
-            if (!interimDiv) {
-                interimDiv = document.createElement('div');
-                interimDiv.classList.add('transcription-item', 'interim');
-                transcriptionDiv.appendChild(interimDiv);
-            }
-
-            // Mettre à jour le contenu de la div interim
-            interimDiv.innerHTML = `
-                <div class="original">${message.originalText}</div>
-                <div class="translation">${message.translatedText}</div>
-            `;
-
-            // Ajouter l'audio à la file d'attente s'il y en a un (cas du receiver)
-            if (message.audioBase64) {
-                this.queueAudio(message.audioBase64);
-            }
-            
-            // Scroll vers le bas après la mise à jour
-            this.scrollToBottom(transcriptionDiv);
-        }
-        
-        // Gérer les transcriptions finales (quand la personne a fini de parler)
-        else if (message.type === 'transcription-final') {
-            // Supprimer la div interim car on a maintenant le texte final
-            const oldInterim = transcriptionDiv.querySelector('.transcription-item.interim');
-            if (oldInterim) {
-                oldInterim.remove();
-            }
-
-            // Créer une nouvelle div pour le texte final
-            const finalItem = document.createElement('div');
-            finalItem.classList.add('transcription-item', 'final');
-            finalItem.innerHTML = `
-                <div class="original">${message.originalText}</div>
-                <div class="translation">${message.translatedText}</div>
-            `;
-            transcriptionDiv.appendChild(finalItem);
-
-            // Ajouter l'audio final à la file d'attente s'il y en a un (cas du receiver)
-            if (message.audioBase64) {
-                this.queueAudio(message.audioBase64);
-            }
-
-            // Scroll vers le bas après la mise à jour
-            this.scrollToBottom(transcriptionDiv);
-        }
-    }
-
-    handleAudioMessage(message) {
-        console.log('Traitement du message audio');
-        // Vérifier que l'audio est présent et valide
-        if (!message.audio || typeof message.audio !== 'string') {
-            console.error('Message audio invalide:', message);
-            return;
-        }
-
-        try {
-            // Vérifier si l'audio est en base64 valide
-            const validBase64 = /^[A-Za-z0-9+/=]+$/.test(message.audio);
-            if (!validBase64) {
-                console.error('Format base64 invalide pour l\'audio');
-                return;
-            }
-
-            console.log('Ajout de l\'audio à la file d\'attente');
-            this.queueAudio(message.audio);
-        } catch (error) {
-            console.error('Erreur lors du traitement du message audio:', error);
-        }
-    }
-
-    // Fonction utilitaire pour s'assurer que le scroll est bien en bas
-    scrollToBottom(element) {
-        // Attendre un peu que le contenu soit mis à jour
-        requestAnimationFrame(() => {
-            element.scrollTop = element.scrollHeight;
-        });
-    }
-
+    // ---- Enregistrement micro (Caller → Serveur) ----
     async startRecording() {
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            const mimeType = 'audio/webm';
+            console.log('Starting mic recording...');
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true
+                }
+            });
             
+            let mimeType = 'audio/webm';
+            if (!MediaRecorder.isTypeSupported(mimeType)) {
+                mimeType = 'audio/webm;codecs=opus';
+            }
+            console.log('Using mime type:', mimeType);
+
             this.mediaRecorder = new MediaRecorder(stream, { mimeType });
-            
-            this.mediaRecorder.ondataavailable = async (e) => {
+
+            this.mediaRecorder.ondataavailable = (e) => {
                 if (e.data.size > 0) {
                     const reader = new FileReader();
                     reader.onloadend = () => {
+                        const base64data = reader.result.split(',')[1];
                         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                            const base64Audio = reader.result.split(',')[1];
+                            console.log('Sending audio chunk:', e.data.size, 'bytes');
                             this.ws.send(JSON.stringify({
                                 type: 'audio',
                                 source: 'caller',
-                                audio: base64Audio,
-                                language: this.config.callerLanguage,
-                                timestamp: Date.now()
+                                audio: base64data,
+                                language: this.config.callerLanguage
                             }));
                         }
                     };
@@ -483,53 +447,100 @@ class EvatradButton {
                 }
             };
 
-            this.mediaRecorder.onstop = () => {
-                stream.getTracks().forEach(track => track.stop());
-            };
-
-            this.mediaRecorder.start(250);
+            this.mediaRecorder.start(100); // More frequent chunks for better latency
             this.isRecording = true;
+            console.log('MediaRecorder started');
         } catch (error) {
-            console.error('Error starting recording:', error);
+            console.error('Error in startRecording:', error);
             throw error;
         }
     }
 
+    // ---- Fin d’appel ----
     async endCall() {
+        if (this.isEndingCall) return;
+        this.isEndingCall = true;
+
         try {
             if (this.currentCallSid) {
-                await fetch(`${this.config.apiBaseUrl}/end-call`, {
+                const response = await fetch(`${this.config.apiBaseUrl}/end-call`, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        callSid: this.currentCallSid
-                    })
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ callSid: this.currentCallSid })
                 });
+                if (!response.ok) {
+                    console.error('Erreur serveur end-call:', response.statusText);
+                }
             }
         } catch (error) {
-            console.error('Error ending call:', error);
+            console.error('Erreur endCall:', error);
         } finally {
-            this.stopWaitingMessage();
-            if (this.mediaRecorder && this.isRecording) {
-                this.mediaRecorder.stop();
-                this.isRecording = false;
-            }
-            if (this.ws) {
-                this.ws.close();
-                this.ws = null;
-            }
-            this.currentCallSid = null;
-            this.updateButtonState(false);
-            this.button.classList.remove('recording');
-            this.modal.hide();
-            if (this.myTranscription) this.myTranscription.innerHTML = '';
-            if (this.otherTranscription) this.otherTranscription.innerHTML = '';
+            this.cleanupAfterCall();
+            this.isEndingCall = false;
         }
+    }
+
+    // ---- Nettoyage ----
+    cleanupAfterCall() {
+        console.log('Cleanup after call');
+        this.stopWaitingLoop();
+        if (this.ui) {
+            this.ui.stopAllAudio();
+        }
+
+        if (this.mediaRecorder && this.isRecording) {
+            this.mediaRecorder.stop();
+            this.isRecording = false;
+        }
+        if (this.ws) {
+            this.ws.close();
+            this.ws = null;
+        }
+        this.currentCallSid = null;
+        this.button.classList.remove('recording');
+        if (this.ui) {
+            this.ui.hideModal();
+            this.ui.updateMainButton(this.button, false);
+            this.ui.clearTranscriptions();
+        }
+    }
+
+    // ---- AudioContext pour iOS ----
+    initAudioContext() {
+        document.addEventListener('click', () => {
+            if (this.ui && !this.ui.audioContext) {
+                this.ui.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                console.log('AudioContext initialisé (iOS).');
+            }
+        }, { once: true });
+    }
+
+    // ---- Méthode utilitaire : lecture "standalone" si pas d’UI ----
+    // (si tu n’as pas envie de stocker l’audio dans la queue du UI)
+    async playAudioStandalone(base64) {
+        return new Promise(async (resolve, reject) => {
+            try {
+                const audio = new Audio(`data:audio/mp3;base64,${base64}`);
+                audio.onended = () => resolve();
+                audio.onerror = (e) => reject(e);
+                audio.play();
+            } catch (err) {
+                reject(err);
+            }
+        });
+    }
+
+    // ---- Convert ArrayBuffer → base64 ----
+    arrayBufferToBase64(buffer) {
+        let binary = '';
+        const bytes = new Uint8Array(buffer);
+        for (let i = 0; i < bytes.byteLength; i++) {
+            binary += String.fromCharCode(bytes[i]);
+        }
+        return window.btoa(binary);
     }
 }
 
-if (typeof module !== 'undefined' && module.exports) {
-    module.exports = EvatradButton;
-}
+// Exporte globalement
+window.EvatradUI = EvatradUI;
+window.EvatradButton = EvatradButton;
