@@ -389,36 +389,38 @@ class EvatradUI {
     // Nouvelle méthode pour jouer les deux audios
     async playBothAudios(originalBase64, ttsBase64) {
         try {
-            // Décoder les audios
-            const originalArrayBuffer = this.decodeBase64ToArrayBuffer(originalBase64);
+            // 1. Pour l'audio original (µ-law)
+            const mulawData = new Uint8Array(atob(originalBase64).split('').map(c => c.charCodeAt(0)));
+            // Utilisons notre méthode decodeMulaw qui convertit directement en PCM
+            const originalBuffer = this.decodeMulaw(mulawData);
+
+            // 2. Pour le TTS (qui est en MP3 et peut être décodé normalement)
             const ttsArrayBuffer = this.decodeBase64ToArrayBuffer(ttsBase64);
-            
-            const originalBuffer = await this.audioContext.decodeAudioData(originalArrayBuffer);
             const ttsBuffer = await this.audioContext.decodeAudioData(ttsArrayBuffer);
 
-            // Créer et configurer les sources audio
+            // 3. Créer et configurer les sources audio
             const originalSource = this.audioContext.createBufferSource();
             const ttsSource = this.audioContext.createBufferSource();
 
             originalSource.buffer = originalBuffer;
             ttsSource.buffer = ttsBuffer;
 
-            // Connecter aux gains respectifs
+            // 4. Connecter aux gains respectifs
             originalSource.connect(this.originalVoiceGain);
             ttsSource.connect(this.ttsVoiceGain);
 
-            // Programmer la lecture synchronisée
-            const startTime = this.audioContext.currentTime;
+            // 5. Démarrer les deux sources exactement en même temps
+            const startTime = this.audioContext.currentTime + 0.1;
             originalSource.start(startTime);
             ttsSource.start(startTime);
 
-            // Retourner une promesse qui se résout quand la traduction est terminée
-            return new Promise((resolve) => {
+            // 6. Retourner une promesse qui se résout quand la lecture est terminée
+            return new Promise(resolve => {
                 ttsSource.onended = resolve;
             });
-        } catch (error) {
-            console.error('Erreur lors de la lecture des deux audios:', error);
-            throw error;
+        } catch (err) {
+            console.error('Erreur lors de la lecture synchronisée:', err);
+            throw err;
         }
     }
 }
