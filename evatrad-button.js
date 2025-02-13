@@ -389,37 +389,82 @@ class EvatradUI {
     // Nouvelle méthode pour jouer les deux audios
     async playBothAudios(originalBase64, ttsBase64) {
         try {
+            console.log('Démarrage de playBothAudios');
+            console.log('Taille de l\'audio original:', originalBase64.length);
+            console.log('Taille de l\'audio TTS:', ttsBase64.length);
+
             // 1. Pour l'audio original (µ-law)
             const mulawData = new Uint8Array(atob(originalBase64).split('').map(c => c.charCodeAt(0)));
+            console.log('Taille des données µ-law décodées:', mulawData.length);
             // Utilisons notre méthode decodeMulaw qui convertit directement en PCM
             const originalBuffer = this.decodeMulaw(mulawData);
+            console.log('Buffer original créé:', originalBuffer.length, 'échantillons');
 
-            // 2. Pour le TTS (qui est en MP3 et peut être décodé normalement)
+            // 2. Pour le TTS
+            console.log('Décodage du TTS...');
             const ttsArrayBuffer = this.decodeBase64ToArrayBuffer(ttsBase64);
-            const ttsBuffer = await this.audioContext.decodeAudioData(ttsArrayBuffer);
+            
+            // Examinons les premiers octets pour identifier le format
+            const ttsHeader = new Uint8Array(ttsArrayBuffer.slice(0, 4));
+            console.log('En-tête TTS (4 premiers octets):', Array.from(ttsHeader).map(b => b.toString(16)));
+            
+            // Essayons de décoder directement comme µ-law aussi
+            try {
+                console.log('Tentative de décodage TTS comme µ-law...');
+                const ttsMulawData = new Uint8Array(ttsArrayBuffer);
+                const ttsBuffer = this.decodeMulaw(ttsMulawData);
+                console.log('Décodage TTS réussi comme µ-law');
 
-            // 3. Créer et configurer les sources audio
-            const originalSource = this.audioContext.createBufferSource();
-            const ttsSource = this.audioContext.createBufferSource();
+                // 3. Créer et configurer les sources audio
+                const originalSource = this.audioContext.createBufferSource();
+                const ttsSource = this.audioContext.createBufferSource();
 
-            originalSource.buffer = originalBuffer;
-            ttsSource.buffer = ttsBuffer;
+                originalSource.buffer = originalBuffer;
+                ttsSource.buffer = ttsBuffer;
 
-            // 4. Connecter aux gains respectifs
-            originalSource.connect(this.originalVoiceGain);
-            ttsSource.connect(this.ttsVoiceGain);
+                // 4. Connecter aux gains respectifs
+                originalSource.connect(this.originalVoiceGain);
+                ttsSource.connect(this.ttsVoiceGain);
 
-            // 5. Démarrer les deux sources exactement en même temps
-            const startTime = this.audioContext.currentTime + 0.1;
-            originalSource.start(startTime);
-            ttsSource.start(startTime);
+                // 5. Démarrer les deux sources exactement en même temps
+                const startTime = this.audioContext.currentTime + 0.1;
+                originalSource.start(startTime);
+                ttsSource.start(startTime);
 
-            // 6. Retourner une promesse qui se résout quand la lecture est terminée
-            return new Promise(resolve => {
-                ttsSource.onended = resolve;
-            });
+                // 6. Retourner une promesse qui se résout quand la lecture est terminée
+                return new Promise(resolve => {
+                    ttsSource.onended = resolve;
+                });
+            } catch (ttsError) {
+                console.error('Échec du décodage TTS comme µ-law:', ttsError);
+                // Si le décodage µ-law échoue, essayons decodeAudioData
+                console.log('Tentative de décodage avec decodeAudioData...');
+                const ttsBuffer = await this.audioContext.decodeAudioData(ttsArrayBuffer);
+                console.log('Décodage TTS réussi avec decodeAudioData');
+
+                // Suite du code identique...
+                const originalSource = this.audioContext.createBufferSource();
+                const ttsSource = this.audioContext.createBufferSource();
+
+                originalSource.buffer = originalBuffer;
+                ttsSource.buffer = ttsBuffer;
+
+                originalSource.connect(this.originalVoiceGain);
+                ttsSource.connect(this.ttsVoiceGain);
+
+                const startTime = this.audioContext.currentTime + 0.1;
+                originalSource.start(startTime);
+                ttsSource.start(startTime);
+
+                return new Promise(resolve => {
+                    ttsSource.onended = resolve;
+                });
+            }
         } catch (err) {
             console.error('Erreur lors de la lecture synchronisée:', err);
+            console.error('Type d\'erreur:', err.name);
+            console.error('Message:', err.message);
+            if (err.stack) console.error('Stack:', err.stack);
             throw err;
         }
     }
