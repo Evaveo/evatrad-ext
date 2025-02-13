@@ -11,24 +11,16 @@ class EvatradUI {
             this.endCallButton = this.modalElement.querySelector('#endCallButton');
         }
 
-        // Un seul AudioContext
-        this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        
-        // Gains pour le mixage
-        this.originalVoiceGain = this.audioContext.createGain();
-        this.originalVoiceGain.gain.value = 0.4;  // 40% pour la voix originale
-        this.originalVoiceGain.connect(this.audioContext.destination);
+        // Gestion audio TTS (Receiver → Caller) sous forme de queue
+        this.audioQueue = [];
+        this.isPlayingAudio = false;
+        this.currentSource = null;
 
-        this.ttsVoiceGain = this.audioContext.createGain();
-        this.ttsVoiceGain.gain.value = 0.9;  // 90% pour la traduction
-        this.ttsVoiceGain.connect(this.audioContext.destination);
-
-        // Stockage temporaire de l'audio original
-        this.lastOriginalAudio = null;
-
-        // Table de conversion µ-law
-        this.mulawTable = null;
-        this.initMulawTable();
+        // Gestion audio mixte (original + TTS)
+        this.audioContext = null;
+        this.originalVoiceGain = null;    // Pour la voix originale
+        this.ttsVoiceGain = null;         // Pour la traduction TTS
+        this.initAudioMixing();
 
         this.onEndCallClick = null;
         if (this.endCallButton) {
@@ -40,80 +32,21 @@ class EvatradUI {
         }
     }
 
-    // Initialisation de la table de conversion µ-law
-    initMulawTable() {
-        this.mulawTable = new Float32Array(256);
-        for (let i = 0; i < 256; i++) {
-            const mu = 255 - i;
-            const sign = (mu & 0x80) ? -1 : 1;
-            const magnitude = ((mu & 0x7f) << 1) + 1;
-            this.mulawTable[i] = sign * (magnitude / 255);
-        }
-    }
-
-    // Décodage de l'audio µ-law en PCM
-    decodeMulaw(mulawData) {
-        // Créer un buffer audio
-        const audioBuffer = this.audioContext.createBuffer(1, mulawData.length, 8000);
-        const channelData = audioBuffer.getChannelData(0);
-        
-        // Convertir chaque échantillon
-        for (let i = 0; i < mulawData.length; i++) {
-            channelData[i] = this.mulawTable[mulawData[i]];
+    // Initialisation du mixage audio
+    initAudioMixing() {
+        if (!this.audioContext) {
+            this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
         }
 
-        return audioBuffer;
-    }
+        // Gain pour la voix originale (50%)
+        this.originalVoiceGain = this.audioContext.createGain();
+        this.originalVoiceGain.gain.value = 0.5;
+        this.originalVoiceGain.connect(this.audioContext.destination);
 
-    // Lecture synchronisée des audios
-    async playAudioPair(originalBase64, ttsBase64) {
-        try {
-            // Convertir le base64 en Uint8Array pour l'audio original (µ-law)
-            const originalData = new Uint8Array(atob(originalBase64).split('').map(c => c.charCodeAt(0)));
-            
-            // Décoder l'audio original
-            const originalBuffer = this.decodeMulaw(originalData);
-            
-            // Décoder le TTS (qui est en MP3)
-            const ttsArrayBuffer = this.decodeBase64ToArrayBuffer(ttsBase64);
-            const ttsBuffer = await this.audioContext.decodeAudioData(ttsArrayBuffer);
-
-            // Créer les sources
-            const originalSource = this.audioContext.createBufferSource();
-            const ttsSource = this.audioContext.createBufferSource();
-
-            // Assigner les buffers
-            originalSource.buffer = originalBuffer;
-            ttsSource.buffer = ttsBuffer;
-
-            // Connecter aux gains
-            originalSource.connect(this.originalVoiceGain);
-            ttsSource.connect(this.ttsVoiceGain);
-
-            // Démarrer la lecture synchronisée
-            const startTime = this.audioContext.currentTime + 0.1;
-            originalSource.start(startTime);
-            ttsSource.start(startTime);
-
-            // Retourner une promesse qui se résout à la fin
-            return new Promise(resolve => {
-                ttsSource.onended = resolve;
-            });
-        } catch (err) {
-            console.error('Erreur lecture synchronisée:', err);
-            throw err;
-        }
-    }
-
-    // Conversion base64 en ArrayBuffer
-    decodeBase64ToArrayBuffer(base64) {
-        const binaryString = atob(base64);
-        const len = binaryString.length;
-        const bytes = new Uint8Array(len);
-        for (let i = 0; i < len; i++) {
-            bytes[i] = binaryString.charCodeAt(i);
-        }
-        return bytes.buffer;
+        // Gain pour le TTS (80%)
+        this.ttsVoiceGain = this.audioContext.createGain();
+        this.ttsVoiceGain.gain.value = 0.8;
+        this.ttsVoiceGain.connect(this.audioContext.destination);
     }
 
     // ---- Interface du modal ----
@@ -213,10 +146,14 @@ class EvatradUI {
     playInlineAudio(base64) {
         return new Promise(async (resolve, reject) => {
             try {
+                if (!this.audioContext) {
+                    this.initAudioMixing();
+                }
                 const arrayBuffer = this.decodeBase64ToArrayBuffer(base64);
                 const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
                 const source = this.audioContext.createBufferSource();
                 source.buffer = audioBuffer;
+                // Connecter au gain TTS au lieu de destination directe
                 source.connect(this.ttsVoiceGain);
 
                 source.onended = () => {
@@ -229,22 +166,73 @@ class EvatradUI {
         });
     }
 
+    // Convertit un base64 en ArrayBuffer
+    decodeBase64ToArrayBuffer(base64) {
+        const binaryString = window.atob(base64);
+        const len = binaryString.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+        }
+        return bytes.buffer;
+    }
+
+    // Crée un en-tête WAV pour des données audio mu-law 8kHz
+    createWavHeader(dataLength) {
+        const buffer = new ArrayBuffer(44);
+        const view = new DataView(buffer);
+        
+        // "RIFF" chunk descriptor
+        this.writeString(view, 0, 'RIFF');
+        view.setUint32(4, 36 + dataLength, true);
+        this.writeString(view, 8, 'WAVE');
+        
+        // "fmt " sub-chunk
+        this.writeString(view, 12, 'fmt ');
+        view.setUint32(16, 16, true);               // Sous-chunk taille
+        view.setUint16(20, 7, true);                // Format = 7 (mu-law)
+        view.setUint16(22, 1, true);                // Canaux = 1 (mono)
+        view.setUint32(24, 8000, true);             // Sample rate = 8000
+        view.setUint32(28, 8000, true);             // Byte rate
+        view.setUint16(32, 1, true);                // Block align
+        view.setUint16(34, 8, true);                // Bits per sample
+        
+        // "data" sub-chunk
+        this.writeString(view, 36, 'data');
+        view.setUint32(40, dataLength, true);       // Taille des données
+        
+        return new Uint8Array(buffer);
+    }
+
+    // Utilitaire pour écrire une chaîne dans un DataView
+    writeString(view, offset, string) {
+        for (let i = 0; i < string.length; i++) {
+            view.setUint8(offset + i, string.charCodeAt(i));
+        }
+    }
+
     // Nouvelle méthode pour jouer la voix originale
-    playOriginalVoice(base64Wav) {
+    playOriginalVoice(base64Audio) {
         try {
-            // Conversion base64 en µ-law
-            const binaryString = atob(base64Wav);
-            const mulawData = new Uint8Array(binaryString.length);
+            // Convertir base64 en Uint8Array
+            const binaryString = atob(base64Audio);
+            const audioData = new Uint8Array(binaryString.length);
             for (let i = 0; i < binaryString.length; i++) {
-                mulawData[i] = binaryString.charCodeAt(i);
+                audioData[i] = binaryString.charCodeAt(i);
             }
 
-            // Décoder µ-law -> PCM
-            const originalBuffer = this.decodeMulaw(mulawData);
+            // Créer un AudioBuffer 8kHz mono
+            const audioBuffer = this.audioContext.createBuffer(1, audioData.length, 8000);
             
+            // Copier les données brutes
+            const channelData = audioBuffer.getChannelData(0);
+            for (let i = 0; i < audioData.length; i++) {
+                channelData[i] = (audioData[i] - 128) / 128.0; // Conversion en -1..1
+            }
+
             // Lecture
             const source = this.audioContext.createBufferSource();
-            source.buffer = originalBuffer;
+            source.buffer = audioBuffer;
             source.connect(this.originalVoiceGain);
             source.start(0);
 
@@ -295,178 +283,115 @@ class EvatradUI {
             this.ttsVoiceGain.gain.value = ttsVolume;
         }
     }
+}
 
-    // Méthode pour synchroniser les audios
-    syncAudio(originalBase64, translationBase64) {
-        // Décode les base64 en ArrayBuffer
-        const originalArrayBuffer = this.decodeBase64ToArrayBuffer(originalBase64);
-        const translationArrayBuffer = this.decodeBase64ToArrayBuffer(translationBase64);
+// Table de conversion µ-law vers PCM linéaire
+EvatradUI.prototype.initMulawTable = function() {
+    if (this.mulawTable) return;
+    
+    this.mulawTable = new Int16Array(256);
+    const MULAW_BIAS = 33;
+    const SIGN_BIT = 0x80;
+    const QUANT_MASK = 0xf;
+    const SEGMENT_SHIFT = 4;
+    const SEGMENT_MASK = 0x70;
 
-        // Crée des AudioBuffer
-        const originalAudioBuffer = this.audioContext.createBuffer(1, originalArrayBuffer.byteLength, 8000);
-        const translationAudioBuffer = this.audioContext.createBuffer(1, translationArrayBuffer.byteLength, 8000);
+    for (let i = 0; i < 256; i++) {
+        let value = i ^ 0xFF; // Complément à 1
+        const sign = (value & SIGN_BIT) ? -1 : 1;
+        value &= ~SIGN_BIT;
 
-        // Copie les données brutes
-        const originalChannelData = originalAudioBuffer.getChannelData(0);
-        const translationChannelData = translationAudioBuffer.getChannelData(0);
-        for (let i = 0; i < originalArrayBuffer.byteLength; i++) {
-            originalChannelData[i] = (originalArrayBuffer[i] - 128) / 128.0; // Conversion en -1..1
-        }
-        for (let i = 0; i < translationArrayBuffer.byteLength; i++) {
-            translationChannelData[i] = (translationArrayBuffer[i] - 128) / 128.0; // Conversion en -1..1
-        }
+        const segment = (value & SEGMENT_MASK) >> SEGMENT_SHIFT;
+        let result = ((value & QUANT_MASK) << 3) + MULAW_BIAS;
+        result <<= segment;
+        result = (sign * (result - MULAW_BIAS));
 
-        // Stocke les AudioBuffer dans le buffer de synchronisation
-        this.audioBuffer.original = originalAudioBuffer;
-        this.audioBuffer.translation = translationAudioBuffer;
+        this.mulawTable[i] = result;
+    }
+}
 
-        // Démarre la lecture des audios synchronisées
-        this.playSyncedAudio();
+// Conversion d'un chunk µ-law en PCM 16-bit
+EvatradUI.prototype.convertMulawToPcm = function(mulawData) {
+    if (!this.mulawTable) {
+        this.initMulawTable();
     }
 
-    // Méthode pour jouer les audios synchronisées
-    playSyncedAudio() {
-        // Crée des sources audio
-        const originalSource = this.audioContext.createBufferSource();
-        const translationSource = this.audioContext.createBufferSource();
-
-        // Connecte les sources aux gains
-        originalSource.connect(this.originalVoiceGain);
-        translationSource.connect(this.ttsVoiceGain);
-
-        // Démarre la lecture des audios
-        originalSource.start(0);
-        translationSource.start(this.syncDelay / 1000); // Démarre la traduction après un délai
-
-        // Stocke les sources dans le buffer de synchronisation
-        this.audioBuffer.originalSource = originalSource;
-        this.audioBuffer.translationSource = translationSource;
+    const pcmData = new Int16Array(mulawData.length);
+    for (let i = 0; i < mulawData.length; i++) {
+        pcmData[i] = this.mulawTable[mulawData[i]];
     }
+    return pcmData;
+}
 
-    // Méthode pour jouer les audios de manière synchronisée
-    async playSynchronizedAudio(originalAudio, translatedAudio, timestamp) {
-        const now = Date.now();
-        const elapsed = now - timestamp;
+// Crée un en-tête WAV pour des données audio PCM 16-bit
+EvatradUI.prototype.createWavHeader = function(dataLength) {
+    const buffer = new ArrayBuffer(44);
+    const view = new DataView(buffer);
+    
+    // "RIFF" chunk descriptor
+    this.writeString(view, 0, 'RIFF');
+    view.setUint32(4, 36 + dataLength * 2, true); // * 2 car PCM 16-bit
+    this.writeString(view, 8, 'WAVE');
+    
+    // "fmt " sub-chunk
+    this.writeString(view, 12, 'fmt ');
+    view.setUint32(16, 16, true);                // Sous-chunk taille
+    view.setUint16(20, 1, true);                 // Format = 1 (PCM)
+    view.setUint16(22, 1, true);                 // Canaux = 1 (mono)
+    view.setUint32(24, 8000, true);              // Sample rate = 8000
+    view.setUint32(28, 8000 * 2, true);          // Byte rate (8000 * 2 car 16-bit)
+    view.setUint16(32, 2, true);                 // Block align (2 car 16-bit)
+    view.setUint16(34, 16, true);                // Bits per sample (16-bit)
+    
+    // "data" sub-chunk
+    this.writeString(view, 36, 'data');
+    view.setUint32(40, dataLength * 2, true);    // Taille des données (* 2 car 16-bit)
+    
+    return new Uint8Array(buffer);
+}
+
+// Nouvelle méthode pour jouer la voix originale
+EvatradUI.prototype.playOriginalVoice = async function(base64Wav) {
+    try {
+        if (!this.audioContext) {
+            this.initAudioMixing();
+        }
+
+        // Conversion base64 en µ-law
+        const binaryString = atob(base64Wav);
+        const mulawData = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+            mulawData[i] = binaryString.charCodeAt(i);
+        }
+
+        // Conversion µ-law -> PCM 16-bit
+        const pcmData = this.convertMulawToPcm(mulawData);
         
-        // Calculer les délais de lecture
-        const translationDelay = Math.max(0, this.syncDelay - elapsed);
-        const originalDelay = Math.max(0, translationDelay - 200); // Légèrement avant la traduction
+        // Créer l'en-tête WAV (pour PCM 16-bit)
+        const header = this.createWavHeader(pcmData.length);
+        
+        // Combiner l'en-tête et les données PCM
+        const completeWav = new Uint8Array(header.length + pcmData.byteLength);
+        completeWav.set(header);
+        completeWav.set(new Uint8Array(pcmData.buffer), header.length);
 
-        try {
-            // Décoder les audios
-            const originalArrayBuffer = this.decodeBase64ToArrayBuffer(originalAudio);
-            const translationArrayBuffer = this.decodeBase64ToArrayBuffer(translatedAudio);
-            
-            const originalBuffer = await this.audioContext.decodeAudioData(originalArrayBuffer);
-            const translationBuffer = await this.audioContext.decodeAudioData(translationArrayBuffer);
+        // Décoder
+        const audioBuffer = await this.audioContext.decodeAudioData(completeWav.buffer);
+        
+        // Lecture
+        const source = this.audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(this.originalVoiceGain);
+        source.start(0);
+        
+        // Garder la référence
+        this.currentSource = source;
 
-            // Créer et configurer les sources audio
-            const originalSource = this.audioContext.createBufferSource();
-            const translationSource = this.audioContext.createBufferSource();
-
-            originalSource.buffer = originalBuffer;
-            translationSource.buffer = translationBuffer;
-
-            // Connecter aux gains respectifs
-            originalSource.connect(this.originalVoiceGain);
-            translationSource.connect(this.ttsVoiceGain);
-
-            // Programmer la lecture synchronisée
-            const startTime = this.audioContext.currentTime;
-            originalSource.start(startTime + originalDelay / 1000);
-            translationSource.start(startTime + translationDelay / 1000);
-
-            // Retourner une promesse qui se résout quand la traduction est terminée
-            return new Promise((resolve) => {
-                translationSource.onended = resolve;
-            });
-        } catch (error) {
-            console.error('Erreur lors de la synchronisation audio:', error);
-            throw error;
-        }
-    }
-
-    // Nouvelle méthode pour jouer les deux audios
-    async playBothAudios(originalBase64, ttsBase64) {
-        try {
-            console.log('Démarrage de playBothAudios');
-            console.log('Taille de l\'audio original:', originalBase64.length);
-            console.log('Taille de l\'audio TTS:', ttsBase64.length);
-
-            // 1. Pour l'audio original (µ-law)
-            const mulawData = new Uint8Array(atob(originalBase64).split('').map(c => c.charCodeAt(0)));
-            console.log('Taille des données µ-law décodées:', mulawData.length);
-            // Utilisons notre méthode decodeMulaw qui convertit directement en PCM
-            const originalBuffer = this.decodeMulaw(mulawData);
-            console.log('Buffer original créé:', originalBuffer.length, 'échantillons');
-
-            // 2. Pour le TTS
-            console.log('Décodage du TTS...');
-            const ttsArrayBuffer = this.decodeBase64ToArrayBuffer(ttsBase64);
-            
-            // Examinons les premiers octets pour identifier le format
-            const ttsHeader = new Uint8Array(ttsArrayBuffer.slice(0, 4));
-            console.log('En-tête TTS (4 premiers octets):', Array.from(ttsHeader).map(b => b.toString(16)));
-            
-            // Essayons de décoder directement comme µ-law aussi
-            try {
-                console.log('Tentative de décodage TTS comme µ-law...');
-                const ttsMulawData = new Uint8Array(ttsArrayBuffer);
-                const ttsBuffer = this.decodeMulaw(ttsMulawData);
-                console.log('Décodage TTS réussi comme µ-law');
-
-                // 3. Créer et configurer les sources audio
-                const originalSource = this.audioContext.createBufferSource();
-                const ttsSource = this.audioContext.createBufferSource();
-
-                originalSource.buffer = originalBuffer;
-                ttsSource.buffer = ttsBuffer;
-
-                // 4. Connecter aux gains respectifs
-                originalSource.connect(this.originalVoiceGain);
-                ttsSource.connect(this.ttsVoiceGain);
-
-                // 5. Démarrer les deux sources exactement en même temps
-                const startTime = this.audioContext.currentTime + 0.1;
-                originalSource.start(startTime);
-                ttsSource.start(startTime);
-
-                // 6. Retourner une promesse qui se résout quand la lecture est terminée
-                return new Promise(resolve => {
-                    ttsSource.onended = resolve;
-                });
-            } catch (ttsError) {
-                console.error('Échec du décodage TTS comme µ-law:', ttsError);
-                // Si le décodage µ-law échoue, essayons decodeAudioData
-                console.log('Tentative de décodage avec decodeAudioData...');
-                const ttsBuffer = await this.audioContext.decodeAudioData(ttsArrayBuffer);
-                console.log('Décodage TTS réussi avec decodeAudioData');
-
-                // Suite du code identique...
-                const originalSource = this.audioContext.createBufferSource();
-                const ttsSource = this.audioContext.createBufferSource();
-
-                originalSource.buffer = originalBuffer;
-                ttsSource.buffer = ttsBuffer;
-
-                originalSource.connect(this.originalVoiceGain);
-                ttsSource.connect(this.ttsVoiceGain);
-
-                const startTime = this.audioContext.currentTime + 0.1;
-                originalSource.start(startTime);
-                ttsSource.start(startTime);
-
-                return new Promise(resolve => {
-                    ttsSource.onended = resolve;
-                });
-            }
-        } catch (err) {
-            console.error('Erreur lors de la lecture synchronisée:', err);
-            console.error('Type d\'erreur:', err.name);
-            console.error('Message:', err.message);
-            if (err.stack) console.error('Stack:', err.stack);
-            throw err;
-        }
+    } catch (err) {
+        console.error('Erreur lecture voix originale:', err);
+        console.log('Type d\'erreur:', err.name);
+        console.log('Message:', err.message);
+        console.log('Code:', err.code);
     }
 }
 
@@ -671,13 +596,6 @@ class EvatradButton {
             const message = JSON.parse(event.data);
 
             switch (message.type) {
-                case 'init':
-                    this.ws.send(JSON.stringify({
-                        type: 'init',
-                        callSid: this.currentCallSid
-                    }));
-                    break;
-
                 case 'call_status':
                     if (this.ui && message.status) {
                         this.ui.setCallStatus(message.status);
@@ -689,50 +607,49 @@ class EvatradButton {
                     }
                     break;
 
-                case 'receiver_raw_audio':
-                    if (this.ui) {
-                        this.ui.lastOriginalAudio = message.data;
-                    }
+                case 'receiver_tts_done':
+                    console.log('Receiver TTS done => receiverReady = true');
+                    this.receiverReady = true;
                     break;
 
-                case 'transcription-final':
                 case 'transcription-interim':
-                    const isFinal = message.type === 'transcription-final';
-                    
-                    if (this.ui) {
-                        // Afficher la transcription
-                        this.ui.appendTranscription(
-                            message.source,
-                            message.originalText,
-                            message.translatedText,
-                            isFinal
-                        );
+                case 'transcription-final':
+                    this.handleTranscriptionMessage(message);
+                    break;
 
-                        // Si c'est un message final du receiver avec audio
-                        if (isFinal && message.source === 'receiver' && message.audioBase64 && this.ui.lastOriginalAudio) {
-                            // Jouer les deux audios de manière synchronisée
-                            this.ui.playBothAudios(
-                                this.ui.lastOriginalAudio,
-                                message.audioBase64
-                            ).catch(err => {
-                                console.error('Erreur lors de la lecture synchronisée:', err);
-                            });
-                        }
+                // ---- VOIX OFF : Si le serveur envoie un flux WAV en base64 ----
+                case 'receiver_raw_audio':
+                    // Lecture "voix off" en fond
+                    if (this.ui) {
+                        this.ui.playOriginalVoice(message.data);
                     }
                     break;
 
-                case 'call-ended':
-                    console.log('Call ended by server');
+                case 'call_ended':
                     this.cleanupAfterCall();
                     break;
 
                 default:
-                    console.log('Unknown message type:', message.type);
+                    console.log('Unhandled websocket message type:', message.type);
                     break;
             }
         } catch (err) {
             console.error('Error parsing websocket message:', err);
         }
+    }
+
+    handleTranscriptionMessage(msg) {
+        const isFinal = (msg.type === 'transcription-final');
+        const source = msg.source; // "caller" ou "receiver"
+        if (!this.ui) return;
+
+        this.ui.appendTranscription(
+            source,
+            msg.originalText,
+            msg.translatedText,
+            isFinal,
+            msg.audioBase64
+        );
     }
 
     // ---- Lecture "voix off" : WAV 8kHz en base64 ----
