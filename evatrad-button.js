@@ -11,20 +11,31 @@ class EvatradUI {
             this.endCallButton = this.modalElement.querySelector('#endCallButton');
         }
 
-        // File d'attente pour les segments audio
-        this.audioSegments = [];
-        
-        // Un seul AudioContext
-        this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        
-        // Gains avec valeurs optimisées
-        this.originalVoiceGain = this.audioContext.createGain();
-        this.originalVoiceGain.gain.value = 0.4;  // 40% pour la voix originale
-        this.originalVoiceGain.connect(this.audioContext.destination);
+        // Gestion audio TTS (Receiver → Caller) sous forme de queue
+        this.audioQueue = [];
+        this.isPlayingAudio = false;
+        this.currentSource = null;
 
-        this.ttsVoiceGain = this.audioContext.createGain();
-        this.ttsVoiceGain.gain.value = 0.9;  // 90% pour la traduction
-        this.ttsVoiceGain.connect(this.audioContext.destination);
+        // Gestion audio mixte (original + TTS)
+        this.audioContext = null;
+        this.originalVoiceGain = null;    // Pour la voix originale
+        this.ttsVoiceGain = null;         // Pour la traduction TTS
+        this.initAudioMixing();
+
+        // Buffer pour stocker l'audio original
+        this.originalAudioBuffer = null;
+        
+        // Configuration de la synchronisation
+        this.syncConfig = {
+            ttsDelay: 0,      // Pas de délai pour le TTS
+            originalDelay: 0   // Pas de délai pour l'original non plus
+        };
+
+        // Stockage des sources audio courantes
+        this.currentSources = {
+            original: null,
+            tts: null
+        };
 
         this.onEndCallClick = null;
         if (this.endCallButton) {
@@ -36,103 +47,78 @@ class EvatradUI {
         }
     }
 
-    // Méthode pour stocker un segment audio
-    addAudioSegment(originalAudio, timestamp) {
-        this.audioSegments.push({
-            timestamp,
-            originalAudio,
-            ttsAudio: null,
-            played: false
-        });
-
-        // Nettoyer les vieux segments
-        this.cleanupOldSegments();
-    }
-
-    // Méthode pour ajouter la traduction TTS à un segment
-    addTtsToSegment(ttsAudio, timestamp) {
-        // Trouver le segment correspondant
-        const segment = this.audioSegments.find(s => 
-            !s.played && !s.ttsAudio && Math.abs(s.timestamp - timestamp) < 1000
-        );
-        
-        if (segment) {
-            segment.ttsAudio = ttsAudio;
-            this.playNextSegment(); // Tenter de jouer le segment
+    // Initialisation du mixage audio avec nouveaux niveaux
+    initAudioMixing() {
+        if (!this.audioContext) {
+            this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
         }
+
+        this.originalVoiceGain = this.audioContext.createGain();
+        this.originalVoiceGain.gain.value = 0.3; // Baissé à 30%
+
+        this.ttsVoiceGain = this.audioContext.createGain();
+        this.ttsVoiceGain.gain.value = 1.0; // Monté à 100%
+
+        this.originalVoiceGain.connect(this.audioContext.destination);
+        this.ttsVoiceGain.connect(this.audioContext.destination);
     }
 
-    // Nettoyer les segments trop vieux
-    cleanupOldSegments() {
-        const tenSecondsAgo = Date.now() - 10000;
-        this.audioSegments = this.audioSegments.filter(s => 
-            !s.played || s.timestamp > tenSecondsAgo
-        );
+    // Stockage de l'audio original
+    storeOriginalAudio(base64Audio) {
+        this.originalAudioBuffer = base64Audio;
     }
 
-    // Jouer le prochain segment complet
-    async playNextSegment() {
-        const segment = this.audioSegments.find(s => 
-            !s.played && s.originalAudio && s.ttsAudio
-        );
+    // Récupération de l'audio original stocké
+    getStoredOriginalAudio() {
+        return this.originalAudioBuffer;
+    }
 
-        if (!segment) return;
+    // Lecture synchronisée des audios
+    async playSynchronizedAudios(originalBase64, ttsBase64) {
+        if (!this.audioContext) {
+            this.initAudioMixing();
+        }
 
         try {
             // Décoder les deux audios
+            const originalArrayBuffer = this.decodeBase64ToArrayBuffer(originalBase64);
+            const ttsArrayBuffer = this.decodeBase64ToArrayBuffer(ttsBase64);
+
             const [originalBuffer, ttsBuffer] = await Promise.all([
-                this.decodeAudio(segment.originalAudio),
-                this.decodeAudio(segment.ttsAudio)
+                this.audioContext.decodeAudioData(originalArrayBuffer),
+                this.audioContext.decodeAudioData(ttsArrayBuffer)
             ]);
 
-            // Créer et configurer les sources
+            // Créer les sources audio
             const originalSource = this.audioContext.createBufferSource();
             const ttsSource = this.audioContext.createBufferSource();
-            
+
             originalSource.buffer = originalBuffer;
             ttsSource.buffer = ttsBuffer;
 
+            // Connecter aux gains respectifs
             originalSource.connect(this.originalVoiceGain);
             ttsSource.connect(this.ttsVoiceGain);
 
-            // Démarrer la lecture synchronisée avec un petit délai
-            const startTime = this.audioContext.currentTime + 0.1;
-            originalSource.start(startTime);
-            ttsSource.start(startTime);
+            // Démarrer les deux sources en même temps
+            const startTime = this.audioContext.currentTime;
+            originalSource.start(startTime + this.syncConfig.originalDelay);
+            ttsSource.start(startTime + this.syncConfig.ttsDelay);
 
-            // Marquer comme joué
-            segment.played = true;
+            // Stocker les sources pour pouvoir les arrêter si besoin
+            this.currentSources = {
+                original: originalSource,
+                tts: ttsSource
+            };
 
-            // Attendre la fin de la lecture
-            await new Promise(resolve => {
+            // Retourner une promesse qui se résout quand la lecture est terminée
+            return new Promise((resolve) => {
                 ttsSource.onended = resolve;
             });
-
-            // Nettoyer les vieux segments
-            this.cleanupOldSegments();
-
         } catch (error) {
-            console.error('Erreur lecture segment:', error);
-            // Marquer comme joué même en cas d'erreur pour éviter les boucles
-            if (segment) segment.played = true;
+            console.error('Erreur lors de la synchronisation:', error);
+            throw error;
         }
-    }
-
-    // Méthode utilitaire pour décoder l'audio
-    async decodeAudio(base64) {
-        const arrayBuffer = this.decodeBase64ToArrayBuffer(base64);
-        return await this.audioContext.decodeAudioData(arrayBuffer);
-    }
-
-    // Utilitaire pour convertir base64 en ArrayBuffer
-    decodeBase64ToArrayBuffer(base64) {
-        const binary = atob(base64);
-        const len = binary.length;
-        const bytes = new Uint8Array(len);
-        for (let i = 0; i < len; i++) {
-            bytes[i] = binary.charCodeAt(i);
-        }
-        return bytes.buffer;
     }
 
     // ---- Interface du modal ----
@@ -232,6 +218,9 @@ class EvatradUI {
     playInlineAudio(base64) {
         return new Promise(async (resolve, reject) => {
             try {
+                if (!this.audioContext) {
+                    this.initAudioMixing();
+                }
                 const arrayBuffer = this.decodeBase64ToArrayBuffer(base64);
                 const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
                 const source = this.audioContext.createBufferSource();
@@ -251,11 +240,11 @@ class EvatradUI {
 
     // Convertit un base64 en ArrayBuffer
     decodeBase64ToArrayBuffer(base64) {
-        const binary = atob(base64);
-        const len = binary.length;
+        const binaryString = window.atob(base64);
+        const len = binaryString.length;
         const bytes = new Uint8Array(len);
-        for (let i=0; i<len; i++){
-            bytes[i] = binary.charCodeAt(i);
+        for (let i = 0; i < len; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
         }
         return bytes.buffer;
     }
@@ -523,16 +512,13 @@ EvatradUI.prototype.createWavHeader = function(dataLength) {
     return new Uint8Array(buffer);
 }
 
-// Utilitaire pour écrire une chaîne dans un DataView
-EvatradUI.prototype.writeString = function(view, offset, string) {
-    for (let i = 0; i < string.length; i++) {
-        view.setUint8(offset + i, string.charCodeAt(i));
-    }
-}
-
 // Nouvelle méthode pour jouer la voix originale
 EvatradUI.prototype.playOriginalVoice = async function(base64Wav) {
     try {
+        if (!this.audioContext) {
+            this.initAudioMixing();
+        }
+
         // Conversion base64 en µ-law
         const binaryString = atob(base64Wav);
         const mulawData = new Uint8Array(binaryString.length);
@@ -781,7 +767,6 @@ class EvatradButton {
     handleWebSocketMessage(event) {
         try {
             const message = JSON.parse(event.data);
-            const timestamp = Date.now();
 
             switch (message.type) {
                 case 'init':
@@ -793,21 +778,25 @@ class EvatradButton {
                     break;
 
                 case 'receiver_raw_audio':
+                    // Au lieu de jouer directement, on stocke l'audio original
                     if (this.ui) {
-                        // Stocker l'audio avec son timestamp
-                        this.ui.addAudioSegment(message.data, timestamp);
+                        this.ui.storeOriginalAudio(message.data);
                     }
                     break;
 
                 case 'transcription-final':
                 case 'transcription-interim':
                     const isFinal = message.type === 'transcription-final';
-                    
-                    // Pour le receiver, ajouter le TTS au segment correspondant
-                    if (isFinal && message.source === 'receiver' && this.ui && message.audioBase64) {
-                        this.ui.addTtsToSegment(message.audioBase64, timestamp);
+
+                    // Si c'est un message final du receiver avec audio
+                    if (isFinal && message.source === 'receiver' && this.ui) {
+                        // Jouer les deux audios de manière synchronisée
+                        this.ui.playSynchronizedAudios(
+                            this.ui.getStoredOriginalAudio(),
+                            message.audioBase64
+                        );
                     }
-                    
+
                     // Gérer la transcription comme avant
                     this.handleTranscriptionMessage(message);
                     break;
@@ -828,7 +817,7 @@ class EvatradButton {
 
     handleTranscriptionMessage(msg) {
         const isCaller = (msg.source === 'caller');
-        const isFinal = (msg.type === 'transcription-final');
+        const isFinal = (msg.type === 'final');
 
         if (this.ui) {
             this.ui.appendTranscription(
@@ -836,11 +825,29 @@ class EvatradButton {
                 msg.originalText,
                 msg.translatedText,
                 isFinal,
-                isCaller ? msg.audioBase64 : null // On joue l'audio TTS uniquement pour le caller
+                isCaller ? msg.audioBase64 : null
             );
-        } else if (isFinal && msg.audioBase64) {
+
+            // Si c'est un message final du receiver avec audio
+            if (!isCaller && isFinal && msg.originalAudioBuffer && msg.audioBase64) {
+                // Synchroniser les audios avec le timestamp
+                const now = Date.now();
+                const elapsed = now - msg.timestamp;
+                const translationDelay = Math.max(0, this.ui.syncDelay - elapsed);
+                const originalDelay = Math.max(0, translationDelay - 200);
+
+                // Préparer et jouer les audios synchronisés
+                this.ui.playSynchronizedAudio(
+                    msg.originalAudioBuffer,
+                    msg.audioBase64,
+                    msg.timestamp
+                );
+            }
+        } else {
             // Mode standalone : jouer uniquement le TTS
-            this.playAudioStandalone(msg.audioBase64);
+            if (isFinal && msg.audioBase64) {
+                this.playAudioStandalone(msg.audioBase64);
+            }
         }
     }
 
