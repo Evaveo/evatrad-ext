@@ -758,34 +758,32 @@ class EvatradButton {
     async playWelcomeMessage() {
         try {
             this.playingWelcome = true;
-            
+        
             // Update UI
             if (this.ui) {
                 this.ui.setCallStatus('Bienvenue...');
             }
-            
+        
+            // Fetch welcome message audio
             const url = `${this.config.apiBaseUrl}/audio-messages?language=${this.config.callerLanguage}&type=welcome`;
-            
-            // Add timestamp to prevent caching issues
-            const finalUrl = url + `&t=${Date.now()}`;
-            
-            const startTime = Date.now();
+            const finalUrl = url + `&t=${Date.now()}`; // Prevent caching
+        
             const resp = await fetch(finalUrl);
-            
-            // Measure network latency
-            this.networkLatency = Date.now() - startTime;
-            
             const blob = await resp.blob();
             const arrayBuffer = await blob.arrayBuffer();
             const base64 = this.arrayBufferToBase64(arrayBuffer);
-
+        
+            // Play the welcome message
             if (this.ui) {
                 await this.ui.playInlineAudioFast(base64);
             } else {
                 await this.playAudioStandalone(base64);
             }
-        } catch (err) {
-            console.error('Erreur playWelcomeMessage:', err);
+        
+            // REMOVE THIS LINE:
+            // this.startWaitingLoop();
+        } catch (error) {
+            console.error('Error playing welcome message:', error);
         } finally {
             this.playingWelcome = false;
         }
