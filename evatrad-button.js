@@ -637,6 +637,7 @@ class EvatradButton {
 
     attachEvents(button) {
         button.addEventListener('click', () => {
+            this.ensureAudioContextInitialized();
             if (this.currentCallSid) {
                 this.endCall();
             } else {
