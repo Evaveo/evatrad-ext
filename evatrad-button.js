@@ -795,78 +795,85 @@ class EvatradButton {
     async startWaitingLoop() {
         // Clear any existing waiting loop
         this.stopWaitingLoop();
-        
+    
         // Set up new loop
         this.waitingLoopActive = true;
         this.playingWaiting = true;
         this.currentWaitingAudio = null;
-        
-        // Use a recursive function instead of a while loop for better control
+    
+        // Configurable delays
+        const LOOP_DELAY = 3000; // Delay between waiting messages
+        const RETRY_DELAY = 5000; // Delay on error
+    
+        // Helper function to play audio
+        const playAudio = async (base64) => {
+            if (this.ui) {
+                // Lower priority for waiting messages
+                await this.ui.playInlineAudioFast(base64);
+            } else {
+                await this.playAudioStandalone(base64);
+            }
+        };
+    
+        // Recursive function to play waiting messages
         const playWaitingMessage = async () => {
+            // Exit if the loop has been stopped
             if (!this.waitingLoopActive) {
                 console.log('Waiting loop stopped');
                 this.playingWaiting = false;
                 return;
             }
-            
+    
             try {
                 // Update UI
                 if (this.ui) {
                     this.ui.setCallStatus('En attente de réponse...');
                 }
-                
+    
+                // Fetch waiting message audio
                 const url = `${this.config.apiBaseUrl}/audio-messages?language=${this.config.callerLanguage}&type=waiting`;
-                // Add timestamp to prevent caching
-                const finalUrl = url + `&t=${Date.now()}`;
-                
+                const finalUrl = url + `&t=${Date.now()}`; // Prevent caching
+    
                 const resp = await fetch(finalUrl);
                 const blob = await resp.blob();
                 const arrayBuffer = await blob.arrayBuffer();
                 const base64 = this.arrayBufferToBase64(arrayBuffer);
-
-                // Check if waiting loop has been stopped while fetching
+    
+                // Exit if the loop has been stopped while fetching
                 if (!this.waitingLoopActive) {
                     console.log('Waiting loop stopped after fetch');
                     this.playingWaiting = false;
                     return;
                 }
-
+    
                 // Store current audio for possible interruption
                 this.currentWaitingAudio = base64;
-                
-                if (this.ui) {
-                    // Lower priority for waiting messages
-                    await this.ui.playInlineAudioFast(base64);
-                } else {
-                    await this.playAudioStandalone(base64);
-                }
-                
-                // Check if waiting loop has been stopped during playback
+    
+                // Play the waiting message
+                await playAudio(base64);
+    
+                // Exit if the loop has been stopped during playback
                 if (!this.waitingLoopActive) {
                     console.log('Waiting loop stopped after playback');
                     this.playingWaiting = false;
                     return;
                 }
-                
-                // Schedule next message after delay
-                this.waitingTimeoutId = setTimeout(() => {
-                    playWaitingMessage();
-                }, 3000);
-                
+    
+                // Schedule the next message
+                this.waitingTimeoutId = setTimeout(playWaitingMessage, LOOP_DELAY);
             } catch (error) {
-                console.error('Erreur startWaitingLoop:', error);
-                
-                // Still try to continue if possible
+                console.error('Error in waiting loop:', error);
+    
+                // Retry after a delay if the loop is still active
                 if (this.waitingLoopActive) {
-                    this.waitingTimeoutId = setTimeout(() => {
-                        playWaitingMessage();
-                    }, 5000); // Longer delay on error
+                    console.log(`Retrying waiting loop in ${RETRY_DELAY}ms...`);
+                    this.waitingTimeoutId = setTimeout(playWaitingMessage, RETRY_DELAY);
                 } else {
                     this.playingWaiting = false;
                 }
             }
         };
-        
+    
         // Start the first message
         playWaitingMessage();
     }
