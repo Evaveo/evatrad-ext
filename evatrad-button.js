@@ -962,6 +962,70 @@ const WELCOME_MESSAGES = {
           }
       }
   
+        // Add this method to your EvatradButton class
+        startWaitingLoop() {
+            console.log('Starting waiting loop');
+            this.waitingLoopActive = true;
+            
+            // Show waiting message in UI
+            if (this.ui) {
+            this.ui.setWaitingMessageVisible(true);
+            }
+            
+            // Function to play waiting message
+            const playWaitingMessage = async () => {
+            if (!this.waitingLoopActive) return;
+            this.playingWaiting = true;
+            
+            try {
+                // Use preloaded audio if available
+                let base64;
+                const cacheKey = `waiting_${this.config.callerLanguage}`;
+                
+                if (this.preloadedAudio.has(cacheKey)) {
+                console.log('Using preloaded waiting message');
+                base64 = this.preloadedAudio.get(cacheKey);
+                } else {
+                // Fetch waiting message audio
+                const url = `${this.config.apiBaseUrl}/audio-messages?language=${this.config.callerLanguage}&type=waiting`;
+                const finalUrl = url + `&t=${Date.now()}`; // Prevent caching
+                
+                const resp = await fetch(finalUrl);
+                const blob = await resp.blob();
+                const arrayBuffer = await blob.arrayBuffer();
+                base64 = this.arrayBufferToBase64(arrayBuffer);
+                
+                // Store for future use
+                this.preloadedAudio.set(cacheKey, base64);
+                }
+                
+                // Remember current waiting audio for potential skipping
+                this.currentWaitingAudio = base64;
+                
+                // Play the waiting message
+                if (this.ui) {
+                await this.ui.playInlineAudioFast(base64);
+                } else {
+                await this.playAudioStandalone(base64);
+                }
+            } catch (error) {
+                console.error('Error playing waiting message:', error);
+            }
+            
+            this.playingWaiting = false;
+            
+            // Schedule next waiting message if loop still active
+            if (this.waitingLoopActive) {
+                this.waitingTimeoutId = setTimeout(playWaitingMessage, 5000); // Play every 5 seconds
+            }
+            };
+            
+            // Start playing waiting messages
+            playWaitingMessage();
+        }
+
+
+
       // Méthode pour arrêter la boucle d'attente
       stopWaitingLoop() {
           console.log('Stop waiting loop called');
@@ -993,43 +1057,176 @@ const WELCOME_MESSAGES = {
           this.playingWaiting = false;
       }
       
-      // Keep WebSocket connection alive with pings
-      startPingInterval() {
-          if (this.pingInterval) {
-              clearInterval(this.pingInterval);
+
+      // Add this method to your EvatradButton class
+    async connectWebSocket() {
+    try {
+      if (this.ws) {
+        // If there's an existing connection, close it properly
+        try {
+          this.ws.close();
+        } catch (err) {
+          console.error('Error closing existing WebSocket:', err);
+        }
+        this.ws = null;
+      }
+  
+      // Find the WebSocket URL
+      let wsUrl = null;
+      const metaTag = document.querySelector('meta[name="websocket-url"]');
+      if (metaTag) {
+        wsUrl = metaTag.content;
+      } else {
+        // Fallback to local WebSocket
+        wsUrl = 'ws://' + window.location.host + '/browser';
+      }
+  
+      console.log('Connecting to WebSocket:', wsUrl);
+  
+      // Create a new WebSocket connection
+      this.ws = new WebSocket(wsUrl);
+  
+      this.ws.onopen = () => {
+        console.log('WebSocket connection established');
+        
+        // Send initialization message with callSid
+        if (this.currentCallSid) {
+          this.ws.send(JSON.stringify({
+            type: 'init',
+            callSid: this.currentCallSid
+          }));
+        }
+        
+        // Start keeping connection alive with pings
+        this.startPingInterval();
+      };
+  
+      this.ws.onmessage = (event) => {
+        this.handleWebSocketMessage(event);
+      };
+  
+      this.ws.onerror = (error) => {
+        console.error('WebSocket error:', error);
+        this.handleConnectionError(error);
+      };
+  
+      this.ws.onclose = () => {
+        console.log('WebSocket connection closed');
+        
+        // Attempt to reconnect if configured to do so
+        if (this.config.autoReconnect && this.currentCallSid) {
+          // Wait a bit before reconnecting
+          setTimeout(() => this.connectWebSocket(), 2000);
+        }
+      };
+  
+      return true;
+    } catch (error) {
+      console.error('Error connecting to WebSocket:', error);
+      this.handleConnectionError(error);
+      return false;
+    }
+  }
+
+// Keep WebSocket connection alive with pings
+startPingInterval() {
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+    }
+    
+    this.pingInterval = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        // Record time for latency calculation
+        this.lastPingTime = Date.now();
+        
+        try {
+          this.ws.send(JSON.stringify({
+            type: 'ping',
+            timestamp: this.lastPingTime
+          }));
+        } catch (error) {
+          console.error('Error sending ping:', error);
+          // Try to reconnect on error
+          if (this.config.autoReconnect) {
+            this.connectWebSocket();
           }
-          
-          this.pingInterval = setInterval(() => {
-              if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                  // Record time for latency calculation
-                  this.lastPingTime = Date.now();
-                  
-                  try {
-                      this.ws.send(JSON.stringify({
-                          type: 'ping',
-                          timestamp: this.lastPingTime
-                      }));
-                  } catch (error) {
-                      console.error('Error sending ping:', error);
-                      // Try to reconnect on error
-                      if (this.config.autoReconnect) {
-                          this.connectWebSocket();
-                      }
-                  }
-              } else if (this.ws && this.ws.readyState !== WebSocket.CONNECTING) {
-                  // Try to reconnect if not already connecting
-                  if (this.config.autoReconnect) {
-                      this.connectWebSocket();
-                  }
+        }
+      } else if (this.ws && this.ws.readyState !== WebSocket.CONNECTING) {
+        // Try to reconnect if not already connecting
+        if (this.config.autoReconnect) {
+          this.connectWebSocket();
+        }
+      }
+    }, 15000); // Every 15 seconds
+  }
+
+
+// Add this method to your EvatradButton class
+async startRecording() {
+    if (this.isRecording) return;
+    
+    try {
+      console.log('Starting audio recording');
+      
+      // Request microphone access
+      this.microphoneStream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        }
+      });
+  
+      // Create a media recorder if supported
+      if (typeof MediaRecorder !== 'undefined') {
+        const options = { mimeType: 'audio/webm;codecs=opus' };
+        this.mediaRecorder = new MediaRecorder(this.microphoneStream, options);
+        
+        // Add data handling
+        this.mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0 && this.ws && this.ws.readyState === 1) {
+            // Convert the audio data to base64 and send it
+            const reader = new FileReader();
+            reader.onloadend = () => {
+              const base64Data = reader.result.split(',')[1];
+              if (this.ws.readyState === 1) {
+                this.ws.send(JSON.stringify({
+                  type: 'audio',
+                  audio: base64Data
+                }));
               }
-          }, 15000); // Every 15 seconds
+            };
+            reader.readAsDataURL(event.data);
+          }
+        };
+        
+        // Start recording with appropriate timeslice (e.g., 100ms chunks)
+        this.mediaRecorder.start(100);
+        this.isRecording = true;
+        
+        console.log('Recording started');
+        return true;
+      } else {
+        console.error('MediaRecorder is not supported in this browser');
+        throw new Error('MediaRecorder not supported');
+      }
+    } catch (error) {
+      console.error('Error starting recording:', error);
+      this.isRecording = false;
+      
+      if (this.ui) {
+        this.ui.setCallStatus(`Error: ${error.message}`);
       }
       
-      // Polling as fallback when WebSocket fails
-      startPollingForStatus() {
-          console.log('Starting status polling as WebSocket fallback');
+      throw error;
+    }
+  }
+
+  // Polling as fallback when WebSocket fails
+  startPollingForStatus() {
+      console.log('Starting status polling as WebSocket fallback');
           
-          if (this.statusPollingInterval) {
+      if (this.statusPollingInterval) {
               clearInterval(this.statusPollingInterval);
           }
           
