@@ -726,6 +726,18 @@ const WELCOME_MESSAGES = {
           // Status polling as WebSocket fallback
           this.statusPollingInterval = null;
   
+          // Bind all methods to this instance
+          this.connectWebSocket = this.connectWebSocket.bind(this);
+          this.startCall = this.startCall.bind(this);
+          this.handleWebSocketMessage = this.handleWebSocketMessage.bind(this);
+          this.startPingInterval = this.startPingInterval.bind(this);
+          this.handleConnectionError = this.handleConnectionError.bind(this);
+          this.startRecording = this.startRecording.bind(this);
+          this.playWelcomeMessage = this.playWelcomeMessage.bind(this);
+          this.startWaitingLoop = this.startWaitingLoop.bind(this);
+          this.stopWaitingLoop = this.stopWaitingLoop.bind(this);
+          this.endCall = this.endCall.bind(this);
+  
           // Initialisation
           this.attachEvents(buttonElement);
           
@@ -827,40 +839,40 @@ const WELCOME_MESSAGES = {
   
       // ---- Démarrage de l'appel ----
       async startCall() {
-        try {
-            if (this.ui) {
-                this.ui.clearTranscriptions();
-                this.ui.setCallStatus('Initialisation...');
-            }
-    
-            // Pour iOS ou autres, s'assurer que l'audioContext est bien créé
-            this.ensureAudioContextInitialized();
-    
-            // Safety timeout - stop waiting after 60 seconds if no answer
-            this.waitingLoopSafetyTimeout = setTimeout(() => {
-                console.log('Safety timeout reached, stopping waiting loop');
-                this.stopWaitingLoop();
-                this.endCall();
-            }, 60000); // 60 seconds
-    
-            // 1) Jouer le message de bienvenue côté Caller
-            await this.playWelcomeMessage();
-    
-            // 2) Démarrer la boucle d'attente APRÈS que le message de bienvenue soit terminé
-            this.startWaitingLoop();
-    
-            // 3) Faire la requête POST /call
-            const startCallTime = Date.now();
-            const response = await fetch(`${this.config.apiBaseUrl}/call`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    to: this.config.phoneNumber,
-                    callerLanguage: this.config.callerLanguage,
-                    receiverLanguage: this.config.receiverLanguage,
-                    partialTtsInterval: this.config.partialTtsInterval
-                })
-            });
+          try {
+              if (this.ui) {
+                  this.ui.clearTranscriptions();
+                  this.ui.setCallStatus('Initialisation...');
+              }
+      
+              // Pour iOS ou autres, s'assurer que l'audioContext est bien créé
+              this.ensureAudioContextInitialized();
+      
+              // Safety timeout - stop waiting after 60 seconds if no answer
+              this.waitingLoopSafetyTimeout = setTimeout(() => {
+                  console.log('Safety timeout reached, stopping waiting loop');
+                  this.stopWaitingLoop();
+                  this.endCall();
+              }, 60000); // 60 seconds
+      
+              // 1) Jouer le message de bienvenue côté Caller
+              await this.playWelcomeMessage();
+      
+              // 2) Démarrer la boucle d'attente APRÈS que le message de bienvenue soit terminé
+              this.startWaitingLoop();
+      
+              // 3) Faire la requête POST /call
+              const startCallTime = Date.now();
+              const response = await fetch(`${this.config.apiBaseUrl}/call`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                      to: this.config.phoneNumber,
+                      callerLanguage: this.config.callerLanguage,
+                      receiverLanguage: this.config.receiverLanguage,
+                      partialTtsInterval: this.config.partialTtsInterval
+                  })
+              });
               // Track network latency
               this.networkLatency = Date.now() - startCallTime;
               
@@ -895,9 +907,6 @@ const WELCOME_MESSAGES = {
               if (this.ui) {
                   this.ui.setCallStatus(`Erreur: ${error.message}`);
               }
-              
-              // Don't auto-end call to allow for fallback mechanisms
-              
           }
       }
   
@@ -1582,4 +1591,3 @@ async startRecording() {
   // Exporte globalement
   window.EvatradUI = EvatradUI;
   window.EvatradButton = EvatradButton;
-      
